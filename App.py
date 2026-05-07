@@ -1267,19 +1267,36 @@ def parse_header(page1_text: str) -> dict:
         info['be_date'] = m.group(1)
     return info
 
-
-def parse_page2(page2_text: str) -> tuple[dict, list[dict]]:
+def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]]:
     meta = {}
     m = re.search(r'\n1\s+(\d{6,})\s*\n.*?(\d{2}-[A-Z]{3}-\d{2})', page2_text, re.DOTALL)
     if m:
         meta['inv_no']   = m.group(1)
         meta['inv_date'] = m.group(2)
+
+    # C. VALUATION section: INV VALUE | FREIGHT | INSURANCE ... DP
+    # Format: <inv_value>  <freight_INR>  <insurance_INR>  ...  DP
     m = re.search(r'([\d.]+)\s+([\d]+)\s+([\d]+)\s+DP', page2_text)
     if m:
         meta['inv_value']  = float(m.group(1))
-        meta['freight']    = float(m.group(2))
-        meta['insurance']  = float(m.group(3))
+        meta['freight']    = float(m.group(2))   # Already in INR from C.Valuation col2
+        meta['insurance']  = float(m.group(3))   # Already in INR from C.Valuation col3
 
+    # D. COST & SERVICES section: col 13 = MISC CHARGE (USD)
+    # Line pattern: "13.MISC CHARGE   14.ASS. VALUE" with a value before the assess value
+    # The misc charges value appears just before the total assess value line
+    meta['misc_charges_inr'] = 0.0
+    m = re.search(r'MISC\s*CHARGE.*?\n\s*(\d+[\d,]*\.\d+)', page2_text, re.DOTALL)
+    if m:
+        try:
+            usd_val = float(m.group(1).replace(',', ''))
+            # Fix: Only apply if value > 0.5 (ignores the random 1 USD anomalies)
+            if usd_val > 0.5: 
+                meta['misc_charges_inr'] = usd_val * exchange_rate
+        except Exception:
+            pass
+
+    # ... rest of items parsing unchanged ...
     items = []
     item_pat = re.compile(
         r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]+\.[\d]{4,6})\s+([\d]+\.[\d]{4,6})\s+PCS\s+([\d]+\.[\d]+)',
@@ -1305,6 +1322,49 @@ def parse_page2(page2_text: str) -> tuple[dict, list[dict]]:
 
     items.sort(key=lambda x: x['sno'])
     return meta, items
+
+def parse_hawb(page1_text: str) -> str:
+    # Looks for the HAWB NO. pattern in the text
+    m = re.search(r'HAWB\s*NO\.\s*([A-Z0-9]+)', page1_text)
+    return m.group(1) if m else "N/A"
+
+def extract_assess_values_from_pages(pdf_pages) -> dict:
+    """Extract 29.ASSESS VALUE for each item from Part III pages."""
+    assess = {}
+    for page in pdf_pages:
+        pg_text = page.extract_text() or ''
+        if 'PART - III' not in pg_text and 'PART III' not in pg_text:
+            continue
+        if 'PART - IV' in pg_text:
+            break
+
+        row_words = get_row_words(page)
+        sorted_ys = sorted(row_words.keys())
+
+        for i, y in enumerate(sorted_ys):
+            words = row_words[y]
+            texts = [t for _, t in words]
+            line  = ' '.join(texts)
+            m = re.match(r'^1\s+(\d{1,2})\s+\d{7,}\s+NOEX', line)
+            if not m:
+                continue
+            sno = int(m.group(1))
+
+            for j in range(i + 1, min(i + 15, len(sorted_ys))):
+                y2     = sorted_ys[j]
+                words2 = row_words[y2]
+                texts2 = [t for _, t in words2]
+                nums = [t for t in texts2 if re.match(r'^\d{3,}\.?\d*$', t)]
+                if len(nums) >= 2:
+                    try:
+                        assess_val = float(nums[-2])
+                        if assess_val > 100:
+                            assess[sno] = assess_val
+                            break
+                    except Exception:
+                        pass
+    return assess
+
 
 
 def extract_duties_from_page(page) -> dict:
@@ -1551,20 +1611,21 @@ def format_date(raw: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def fill_excel(header: dict, meta: dict, items: list, duties: dict, licences: list) -> bytes:
+def fill_excel(header: dict, meta: dict, items: list, duties: dict, licences: list, assess_values: dict = None) -> bytes:
     wb = load_workbook(io.BytesIO(get_template_bytes()))
-    _fill_c_sheet(wb, header, meta, items)
+    _fill_c_sheet(wb, header, meta, items, duties, assess_values or {})
     _fill_d_details(wb, items, duties, licences)
     out = io.BytesIO()
     wb.save(out)
-    return out.getvalue()
+    return out.getvalue()    
 
 
-def _fill_c_sheet(wb, header, meta, items):
+def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     cs = wb['C-SHEET']
     n  = len(items)
+    exchange_rate = header.get('exchange_rate', 1.0)
 
     def _s(style='thin'): return Side(style=style, color='000000')
     def _ab(): s=_s(); return Border(left=s, right=s, top=s, bottom=s)
@@ -1577,6 +1638,8 @@ def _fill_c_sheet(wb, header, meta, items):
     GREY_FILL  = PatternFill('solid', fgColor='D8D8D8')
     SUM_FILL   = PatternFill('solid', fgColor='BDD7EE')
     HDR_FILL   = PatternFill('solid', fgColor='2E75B6')
+    EXTRA_FILL = PatternFill('solid', fgColor='E2EFDA')
+    ASSESS_FILL= PatternFill('solid', fgColor='FFF2CC')
 
     WHT_BOLD = Font(name='Calibri', bold=True,  color='FFFFFF', size=10)
     BLK_BOLD = Font(name='Calibri', bold=True,  color='000000', size=10)
@@ -1593,12 +1656,14 @@ def _fill_c_sheet(wb, header, meta, items):
         if border:  cell.border        = border
         if num_fmt: cell.number_format = num_fmt
 
-    for col, w in [('A',7),('B',40),('C',7),('D',10),('E',12),
-                   ('F',16),('G',16),('H',16),('I',16),('J',13),('K',13)]:
-        cs.column_dimensions[col].width = w
+        for col, w in [('A',7),('B',40),('C',7),('D',10),('E',12),
+                   ('F',16),('G',16),('H',16),('I',16),('J',13),('K',13),
+                   ('L',14),('M',14),('N',12),('O',16),('P',18),('Q',12),
+                   ('R',14),('S',12),('T',14)]:
+         cs.column_dimensions[col].width = w
 
     for row in range(12, 12 + max(n, 15) + 5):
-        for col in range(1, 12):
+        for col in range(1, 21):
             c = cs.cell(row=row, column=col)
             c.value = None; c.fill = PatternFill(fill_type=None)
             c.font = Font(name='Calibri', size=10); c.border = Border()
@@ -1612,18 +1677,47 @@ def _fill_c_sheet(wb, header, meta, items):
         _st(cs[addr], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
     for addr in ['B6','D6','F6','B8','F8','B9']:
         _st(cs[addr], font=BLK_NORM, fill=GREY_FILL, align=LEFT, border=_ab())
+    
+        # Freight from Part II C.Valuation col2 (INR)
+    cs['I5'].value = meta.get('freight', 0)
+
+    # Insurance from Part II C.Valuation col3 (INR)
+    cs['I6'].value = meta.get('insurance', 0)
+
+    # Freight Charges - 2: misc charges from Part II D.Cost col13 (USD → INR)
+        # ── Freight Charges - 2 ──────────────────────────────────────────────────
+    j5 = cs['J5']
+    j5.value = 'Freight charges - 2'
+    _st(j5, font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
+
+    # ALWAYS initialize k5, then set its value
+    k5 = cs['K5']
+    # If the value is missing or 0, it will just show 0.00
+    misc_inr_val = meta.get('misc_charges_inr', 0.0)
+    k5.value = misc_inr_val 
+    
+    # Apply the styling
+    _st(k5, font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
     for r in range(5, 11):
         cs.row_dimensions[r].height = 18
 
-    headers = {1:'S.NO', 2:'DESCRIPTION OF GOODS', 3:'QTY', 4:'RATE (USD)',
-               5:'VALUE (USD)', 6:'INR VALUE', 7:'CUSTOM DUTY PAID',
-               8:'TOTAL EXPENSES / PCS', 9:'COST PER PIECE',
-               10:'+2% MARGIN', 11:'TOTAL COST'}
+        headers = {
+        1:'S.NO', 2:'DESCRIPTION OF GOODS', 3:'QTY', 4:'RATE (USD)',
+        5:'VALUE (USD)', 6:'INR VALUE', 7:'CUSTOM DUTY PAID',
+        8:'TOTAL EXPENSES / PCS', 9:'COST PER PIECE',
+        10:'+2% MARGIN', 11:'TOTAL COST',
+        12:'F1', 13:'F2', 14:'insurance',
+        15:'Assess Value', 16:'Assess Value as per BOE', 17:'Difference',
+        18:'Custom', 19:'Swc', 20:'Igst',
+    }
     for col, txt in headers.items():
         c = cs.cell(row=11, column=col)
         c.value = txt
-        _st(c, font=WHT_BOLD, fill=HDR_FILL, align=CENTER, border=_ab())
+        fill = HDR_FILL if col <= 11 else EXTRA_FILL
+        font = WHT_BOLD if col <= 11 else BLK_BOLD
+        _st(c, font=font, fill=fill, align=CENTER, border=_ab())
+
     cs.row_dimensions[11].height = 22
 
     first_row = 12
@@ -1668,7 +1762,53 @@ def _fill_c_sheet(wb, header, meta, items):
 
         c = cs.cell(row=row, column=11); c.value = f'=C{row}*J{row}'
         _st(c, font=BLK_NORM, fill=PatternFill(fill_type=None), align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+        
+                # L: F1 — Freight prorated
+        c = cs.cell(row=row, column=12)
+        c.value = f'=$I$5/$F${total_row}*F{row}'
+        _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
+        # M: F2 — Freight charges-2 prorated
+        c = cs.cell(row=row, column=13)
+        c.value = f'=$K$5/$F${total_row}*F{row}'
+        _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # N: insurance prorated
+        c = cs.cell(row=row, column=14)
+        c.value = f'=$I$6/$F${total_row}*F{row}'
+        _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # O: Assess Value (calculated) = INR + F1 + F2 + insurance
+        c = cs.cell(row=row, column=15)
+        c.value = f'=F{row}+L{row}+M{row}+N{row}'
+        _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # P: Assess Value as per BOE (from PDF Part III col 29)
+        c = cs.cell(row=row, column=16)
+        c.value = assess_values.get(it['sno'], 0.0)
+        _st(c, font=BLK_BOLD, fill=ASSESS_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # Q: Difference
+        c = cs.cell(row=row, column=17)
+        c.value = f'=O{row}-P{row}'
+        _st(c, font=BLK_NORM, fill=PatternFill(fill_type=None), align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # R: Custom (BCD from D-DETAILS)
+        c = cs.cell(row=row, column=18)
+        c.value = f"='D-DETAILS'!C{d_row}"
+        _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # S: Swc (SWS from D-DETAILS)
+        c = cs.cell(row=row, column=19)
+        c.value = f"='D-DETAILS'!D{d_row}"
+        _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        # T: Igst (IGST from D-DETAILS)
+        c = cs.cell(row=row, column=20)
+        c.value = f"='D-DETAILS'!E{d_row}"
+        _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
+
+        
         cs.row_dimensions[row].height = 18
 
     fr = first_row; lr = first_row + n - 1
@@ -1678,6 +1818,11 @@ def _fill_c_sheet(wb, header, meta, items):
         5: f'=SUM(E{fr}:E{lr})', 6: f'=SUM(F{fr}:F{lr})',
         7: f'=SUM(G{fr}:G{lr})', 8: f'=SUM(H{fr}:H{lr})',
         9: None, 10: None, 11: f'=SUM(K{fr}:K{lr})',
+        12: f'=SUM(L{fr}:L{lr})', 13: f'=SUM(M{fr}:M{lr})',
+        14: f'=SUM(N{fr}:N{lr})', 15: f'=SUM(O{fr}:O{lr})',
+        16: f'=SUM(P{fr}:P{lr})', 17: f'=SUM(Q{fr}:Q{lr})',
+        18: f'=SUM(R{fr}:R{lr})', 19: f'=SUM(S{fr}:S{lr})',
+        20: f'=SUM(T{fr}:T{lr})',
     }
     for col, val in totals.items():
         c = cs.cell(row=total_row, column=col); c.value = val
@@ -1949,13 +2094,15 @@ if pdf_file:
                     pages_text.append(p.extract_text() or "")
 
             header = parse_header(pages_text[0])
+            ex_rate = header.get('exchange', 1.0)
+            hawb_no = parse_hawb(pages_text[0])
 
             invoice_text = ''
             for _pg_txt in pages_text[1:]:
                 if 'PART - III' in _pg_txt:
                     break
                 invoice_text += _pg_txt + '\n'
-            meta, items = parse_page2(invoice_text)
+            meta, items = parse_page2(invoice_text, ex_rate)
 
             # Parse licences using positional word extraction (page object needed)
             licences = []
@@ -1975,6 +2122,23 @@ if pdf_file:
                     seen.add(key)
                     unique_lics.append(lic)
             licences = unique_lics
+
+                        # Extract Assess Values from Part III
+            assess_values = {}
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                part3_pages = []
+                in_p3 = False
+                for pg in pdf.pages:
+                    pg_text = pg.extract_text() or ''
+                    if 'PART - III' in pg_text:
+                        in_p3 = True
+                    if in_p3:
+                        part3_pages.append(pg)
+                    if in_p3 and 'PART - IV' in pg_text:
+                        break
+                assess_values = extract_assess_values_from_pages(part3_pages)
+
+            
 
             all_duties['_be_no']   = header.get('be_no', '')
             all_duties['_be_date'] = header.get('be_date', '')
@@ -2071,8 +2235,11 @@ if pdf_file:
 
     with st.spinner("✍️ Filling Excel..."):
         try:
-            filled_bytes = fill_excel(header, meta, items, all_duties, licences)
+            filled_bytes = fill_excel(header, meta, items, all_duties, licences, assess_values)
             filename = f"BOE_{meta.get('inv_no', 'filled')}.xlsx"
+            if filled_bytes is None:
+                st.error("❌ fill_excel returned None — check _fill_c_sheet for errors")
+                st.stop()
         except Exception as e:
             st.error(f"❌ Excel filling error: {e}")
             st.exception(e)
