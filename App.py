@@ -1,16 +1,3 @@
-"""
-BOE PDF → Excel Auto-Filler  |  Ferrari Video / Focal Shipments
-================================================================
-- Excel template is EMBEDDED — just upload BOE PDF each time
-- Handles ANY number of items (not fixed at 10)
-- Writes all formulas dynamically (F col, BCD licence formulas)
-- Preserves all existing Excel formulas in summary rows
-
-Install:  pip install streamlit pdfplumber openpyxl pandas
-Run:      streamlit run boe_to_excel_app.py
-================================================================
-"""
-
 import re, io, base64
 import pdfplumber
 import streamlit as st
@@ -1233,9 +1220,6 @@ TEMPLATE_B64 = (
 
 
 
-
-
-
 def get_template_bytes() -> bytes:
     return base64.b64decode(TEMPLATE_B64)
 
@@ -1253,50 +1237,185 @@ def get_row_words(page, min_x: float = 60) -> dict:
             rows[round(w['top'])].append((w['x0'], w['text']))
     return {y: sorted(v, key=lambda x: x[0]) for y, v in rows.items()}
 
+def parse_be_no_from_pages(pages_text: list) -> str:
+    for pg_text in pages_text:
+        # Pattern 1: "BE No\n<number>"
+        m = re.search(r'BE\s*No\.?\s*\n\s*(\d{6,})', pg_text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # Pattern 2: "BE No <number>" on same line
+        m = re.search(r'BE\s*No\.?\s+(\d{6,})', pg_text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # Pattern 3: "BE No" anywhere followed within 50 chars by a 7+ digit number
+        m = re.search(r'BE\s*No.{0,50}?(\d{7,})', pg_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1)
+    return ""
 
 def parse_header(page1_text: str) -> dict:
     info = {}
+
+    # Exchange rate
     m = re.search(r'1 USD=([\d.]+)INR', page1_text)
     if m:
         info['exchange_rate'] = float(m.group(1))
-    m = re.search(r'BE\s*No\b.*?(\d{7,})', page1_text)
+
+    # BE No — appears in the header table as "BE No  8555370"
+    m = re.search(r'BE\s*No\s+(\d{6,})', page1_text)
     if m:
         info['be_no'] = m.group(1)
+
+    # BE Date
     m = re.search(r'(\d{2}/\d{2}/\d{4})\s+H\b', page1_text)
     if m:
         info['be_date'] = m.group(1)
+
     return info
 
-def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]]:
-    meta = {}
-    m = re.search(r'\n1\s+(\d{6,})\s*\n.*?(\d{2}-[A-Z]{3}-\d{2})', page2_text, re.DOTALL)
-    if m:
-        meta['inv_no']   = m.group(1)
-        meta['inv_date'] = m.group(2)
 
-    # C. VALUATION section: INV VALUE | FREIGHT | INSURANCE ... DP
-    # Format: <inv_value>  <freight_INR>  <insurance_INR>  ...  DP
-    m = re.search(r'([\d.]+)\s+([\d]+)\s+([\d]+)\s+DP', page2_text)
+def parse_hawb(page1_text: str) -> str:
+    # Pattern 1: date followed by 9+ digit number followed by date
+    m = re.search(r'\d{2}/\d{2}/\d{4}\s+(\d{9,})\s+\d{2}/\d{2}/\d{4}', page1_text)
     if m:
-        meta['inv_value']  = float(m.group(1))
-        meta['freight']    = float(m.group(2))   # Already in INR from C.Valuation col2
-        meta['insurance']  = float(m.group(3))   # Already in INR from C.Valuation col3
+        return m.group(1)
 
-    # D. COST & SERVICES section: col 13 = MISC CHARGE (USD)
-    # Line pattern: "13.MISC CHARGE   14.ASS. VALUE" with a value before the assess value
-    # The misc charges value appears just before the total assess value line
-    meta['misc_charges_inr'] = 0.0
-    m = re.search(r'MISC\s*CHARGE.*?\n\s*(\d+[\d,]*\.\d+)', page2_text, re.DOTALL)
+    # Pattern 2: HAWB NO label with value nearby (same line or next line)
+    m = re.search(r'HAWB\s*NO\s*[:\-]?\s*\n?\s*(\d{8,})', page1_text, re.IGNORECASE)
     if m:
+        return m.group(1)
+
+    # Pattern 3: look for a standalone 11-digit number (HAWB is typically 11 digits)
+    # preceded by a date in the manifest block
+    manifest_idx = page1_text.upper().find('MANIFEST')
+    if manifest_idx != -1:
+        block = page1_text[manifest_idx: manifest_idx + 800]
+        m = re.search(r'(\d{11,12})', block)
+        if m:
+            return m.group(1)
+
+    return "N/A"
+
+
+def parse_supplier(page2_text: str) -> str:
+    # Pattern 1: name on next line after header
+    m = re.search(
+        r'3\.?\s*SUPPLIER\s+NAME\s*[&A][\w\s]*ADDRESS\s*\n\s*([^\n]{3,})',
+        page2_text, re.IGNORECASE
+    )
+    if m:
+        val = m.group(1).strip()
+        if not re.match(r'^\d|^4\.', val):
+            return val
+
+    # Pattern 2: name on same line, before "4." or end of line
+    m = re.search(
+        r'3\.?\s*SUPPLIER\s+NAME\s*[&A][\w\s]*ADDRESS\s+([A-Z][A-Za-z0-9\s\-\.&,]{3,?}?)(?:\s{3,}|\s*4\.|\s*\n)',
+        page2_text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+
+    # Pattern 3: look for the label then grab everything up to next section number
+    m = re.search(
+        r'SUPPLIER\s+NAME[^0-9]{0,20}((?:[A-Z][A-Za-z0-9\s\-\.&,]){4,40})',
+        page2_text, re.IGNORECASE
+    )
+    if m:
+        return m.group(1).strip()
+
+    return ""
+
+
+def parse_invoice_no(page1_text: str) -> str:
+    """
+    Extract Invoice No from Part I — I. INVOICE DETAILS - SUMMARY#
+    The table has columns: 1.S.NO | 2.INVOICE NO | 3.INV.AMT | 4.CUR
+    We want col 2 (INVOICE NO).
+    """
+    # After "1  " we expect the invoice number then amount then currency
+    m = re.search(r'\bINVOICE\s+NO\b.*?\n\s*1\s+(\d{6,})', page1_text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Broader fallback: look for the summary line "1  02242026  4524.5  USD"
+    m = re.search(r'^\s*1\s+(\d{6,})\s+[\d.]+\s+USD', page1_text, re.MULTILINE)
+    if m:
+        return m.group(1)
+    return ""
+
+def parse_invoice_summary(page1_text: str) -> dict:
+    result = {}
+
+    # Find the INVOICE DETAILS section
+    idx = -1
+    for marker in ['INVOICE DETAILS - SUMMARY', 'INVOICE DETAILS', 'I. INVOICE']:
+        idx = page1_text.upper().find(marker)
+        if idx != -1:
+            break
+    if idx == -1:
+        return result
+
+    block = page1_text[idx: idx + 600]
+
+    # Try: data row with  1  <INV_NO>  <AMT>  USD  (flexible spacing)
+    m = re.search(r'\b1\s+(\S+)\s+([\d,]+\.?\d*)\s+USD', block, re.IGNORECASE)
+    if m:
+        result['inv_no']    = m.group(1).strip()
         try:
-            usd_val = float(m.group(1).replace(',', ''))
-            # Fix: Only apply if value > 0.5 (ignores the random 1 USD anomalies)
-            if usd_val > 0.5: 
-                meta['misc_charges_inr'] = usd_val * exchange_rate
+            result['inv_value'] = float(m.group(2).replace(',', ''))
+        except Exception:
+            pass
+        return result
+
+    # Fallback: search entire page1 for the data row pattern
+    m = re.search(r'\b1\s+(\S+)\s+([\d,]+\.?\d*)\s+USD', page1_text, re.IGNORECASE)
+    if m:
+        result['inv_no']    = m.group(1).strip()
+        try:
+            result['inv_value'] = float(m.group(2).replace(',', ''))
         except Exception:
             pass
 
-    # ... rest of items parsing unchanged ...
+    return result
+
+def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]]:
+    meta = {}
+
+    # Invoice number from A. INVOICE section
+    m = re.search(r'\n1\s+(\d{6,})\s*\n', page2_text)
+    if m:
+        meta['inv_no'] = m.group(1)
+
+    # Invoice date
+    m = re.search(r'(\d{2}-[A-Z]{3}-\d{2})', page2_text)
+    if m:
+        meta['inv_date'] = m.group(1)
+
+    # C. VALUATION section: INV VALUE (USD) | FREIGHT (INR) | INSURANCE (INR) ... DP
+    m = re.search(r'([\d.]+)\s+([\d]+)\s+([\d]+)\s+DP', page2_text)
+    if m:
+        meta['inv_value']  = float(m.group(1))   # USD total invoice value
+        meta['freight']    = float(m.group(2))   # Already in INR
+        meta['insurance']  = float(m.group(3))   # Already in INR
+
+    # D. COST & SERVICES — col 13 MISC CHARGE
+    meta['misc_charges_inr'] = 0.0
+    misc_idx = page2_text.upper().find('MISC')
+    if misc_idx != -1:
+    # Look in a window around the MISC label for a decimal number
+        window = page2_text[misc_idx: misc_idx + 300]
+    # Find all decimal numbers in the window, pick first one > 0
+        nums = re.findall(r'\b(\d+\.\d+)\b', window)
+        for n in nums:
+            try:
+                val = float(n)
+                if val > 0.5:
+                    meta['misc_charges_inr'] = round(val * exchange_rate, 2)
+                    break
+            except Exception:
+                pass
+
+    # Item parsing
     items = []
     item_pat = re.compile(
         r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]+\.[\d]{4,6})\s+([\d]+\.[\d]{4,6})\s+PCS\s+([\d]+\.[\d]+)',
@@ -1323,10 +1442,6 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
     items.sort(key=lambda x: x['sno'])
     return meta, items
 
-def parse_hawb(page1_text: str) -> str:
-    # Looks for the HAWB NO. pattern in the text
-    m = re.search(r'HAWB\s*NO\.\s*([A-Z0-9]+)', page1_text)
-    return m.group(1) if m else "N/A"
 
 def extract_assess_values_from_pages(pdf_pages) -> dict:
     """Extract 29.ASSESS VALUE for each item from Part III pages."""
@@ -1364,7 +1479,6 @@ def extract_assess_values_from_pages(pdf_pages) -> dict:
                     except Exception:
                         pass
     return assess
-
 
 
 def extract_duties_from_page(page) -> dict:
@@ -1410,28 +1524,18 @@ def extract_duties_from_page(page) -> dict:
 def parse_licences_from_page(page) -> list[dict]:
     """
     Extract F. LICENCE DETAILS rows using word x-positions.
-
-    Table columns (from PDF):
-      1.INVSNO | 2.ITMSNO | 3.LIC SLNO | 4.LIC NO | 5.LIC DATE | 6.CODE | 7.PORT
-      | 8.DEBIT VALUE | 9.QTY | 10.UQC | 11.DEBIT DUTY
-
-    We find the header row first to calibrate x-positions for each column,
-    then read every data row using those same x-ranges.
-    The LAST numeric column on each row = col 11 DEBIT DUTY.
     """
     licences = []
 
-    # Check page has licence table
     page_text = page.extract_text() or ''
     if 'LICENCE DETAILS' not in page_text:
         return licences
 
-    row_words = get_row_words(page, min_x=0)  # min_x=0 to catch all columns
+    row_words = get_row_words(page, min_x=0)
     sorted_ys = sorted(row_words.keys())
 
-    # ── Step 1: Find the header row (contains "DEBIT DUTY" or "ITMSNO") ──────
     header_y   = None
-    col_bounds = {}   # col_name → (x_min, x_max)
+    col_bounds = {}
 
     for y in sorted_ys:
         words = row_words[y]
@@ -1439,41 +1543,24 @@ def parse_licences_from_page(page) -> list[dict]:
         line  = ' '.join(texts)
         if 'ITMSNO' in line or ('DEBIT' in line and 'DUTY' in line):
             header_y = y
-            # Map each header word to its x position
             for x, t in words:
                 col_bounds[t] = x
             break
 
     if header_y is None:
-        # Fallback: try text-based extraction
         return _parse_licences_text_fallback(page_text)
 
-    # ── Step 2: Identify x-position of col 11 (DEBIT DUTY = last column) ────
-    # "DEBIT" and "DUTY" may be on same row as separate words
-    # The rightmost numeric-header word x = DEBIT DUTY column x
     header_words = row_words[header_y]
-    # x of "DUTY" or the rightmost word in header
     duty_x = max(x for x, _ in header_words)
 
-    # ── Step 3: Identify x of ITMSNO (col 2) ─────────────────────────────────
     itmsno_x = None
     for x, t in header_words:
         if 'ITMSNO' in t or t == '2.ITMSNO':
             itmsno_x = x
             break
-    # fallback: second word x
     if itmsno_x is None and len(header_words) >= 2:
         itmsno_x = sorted(x for x, _ in header_words)[1]
 
-    # ── Step 4: Identify x of LIC NO (col 4) ─────────────────────────────────
-    licno_x = None
-    for x, t in header_words:
-        if 'LIC' in t and licno_x is None:
-            licno_x = x
-        elif 'NO' in t and licno_x is not None:
-            break
-
-    # ── Step 5: Read data rows below the header ───────────────────────────────
     reading = False
     for y in sorted_ys:
         if y == header_y:
@@ -1489,44 +1576,35 @@ def parse_licences_from_page(page) -> list[dict]:
         texts_only = [t for _, t in words]
         line = ' '.join(texts_only)
 
-        # Stop if we hit another section header
         if any(kw in line for kw in ['SCHEME NOTIFICATION', 'PART -', 'PART-', 'G. SCHEME']):
             break
 
-        # Each data row starts with INVSNO = 1
-        # First word should be "1" (INVSNO)
         first_text = texts_only[0]
         if first_text != '1':
             continue
 
-        # We need at least 4 words: INVSNO, ITMSNO, ..., DEBIT_DUTY
         if len(words) < 4:
             continue
 
-        # ── Extract ITMSNO: second numeric token ─────────────────────────────
         numeric_tokens = [(x, t) for x, t in words if re.match(r'^[\d.]+$', t)]
         if len(numeric_tokens) < 2:
             continue
 
-        itmsno_val = numeric_tokens[1][1]   # second numeric = ITMSNO
+        itmsno_val = numeric_tokens[1][1]
         try:
             itmsno = int(itmsno_val)
         except ValueError:
             continue
 
-        # ── Extract DEBIT DUTY: LAST numeric token on this row ───────────────
-        # Col 11 is always the rightmost column in the table
         last_numeric = numeric_tokens[-1][1]
         try:
             debit_duty = float(last_numeric)
         except ValueError:
             continue
 
-        # Sanity check: debit_duty should be > 0 and look like a duty amount
         if debit_duty <= 0:
             continue
 
-        # ── Extract LIC NO: first long numeric string (9-10 digits) ──────────
         lic_no = ''
         for _, t in words:
             cleaned = re.sub(r'[^0-9]', '', t)
@@ -1544,12 +1622,6 @@ def parse_licences_from_page(page) -> list[dict]:
 
 
 def _parse_licences_text_fallback(page_text: str) -> list[dict]:
-    """
-    Text-based fallback parser for licence table.
-    Splits each line by whitespace and picks:
-      - position 1 → ITMSNO  (0-indexed after INVSNO=1)
-      - last token  → DEBIT DUTY (col 11, always rightmost)
-    """
     licences = []
     idx = page_text.find('LICENCE DETAILS')
     if idx == -1:
@@ -1560,7 +1632,6 @@ def _parse_licences_text_fallback(page_text: str) -> list[dict]:
 
     for line in lines:
         parts = line.strip().split()
-        # Row starts with "1" (INVSNO) and has enough columns
         if not parts or parts[0] != '1' or len(parts) < 6:
             continue
         try:
@@ -1568,7 +1639,6 @@ def _parse_licences_text_fallback(page_text: str) -> list[dict]:
         except (ValueError, IndexError):
             continue
 
-        # Last token = DEBIT DUTY
         try:
             debit_duty = float(parts[-1])
         except (ValueError, IndexError):
@@ -1577,7 +1647,6 @@ def _parse_licences_text_fallback(page_text: str) -> list[dict]:
         if debit_duty <= 0:
             continue
 
-        # Find LIC NO: first token with 9+ digits
         lic_no = ''
         for p in parts:
             cleaned = re.sub(r'[^0-9]', '', p)
@@ -1617,7 +1686,7 @@ def fill_excel(header: dict, meta: dict, items: list, duties: dict, licences: li
     _fill_d_details(wb, items, duties, licences)
     out = io.BytesIO()
     wb.save(out)
-    return out.getvalue()    
+    return out.getvalue()
 
 
 def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
@@ -1656,11 +1725,11 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         if border:  cell.border        = border
         if num_fmt: cell.number_format = num_fmt
 
-        for col, w in [('A',7),('B',40),('C',7),('D',10),('E',12),
-                   ('F',16),('G',16),('H',16),('I',16),('J',13),('K',13),
-                   ('L',14),('M',14),('N',12),('O',16),('P',18),('Q',12),
-                   ('R',14),('S',12),('T',14)]:
-         cs.column_dimensions[col].width = w
+    for col, w in [('A',7),('B',40),('C',7),('D',10),('E',12),
+               ('F',16),('G',16),('H',16),('I',16),('J',13),('K',13),
+               ('L',14),('M',14),('N',12),('O',16),('P',18),('Q',12),
+               ('R',14),('S',12),('T',14)]:
+        cs.column_dimensions[col].width = w
 
     for row in range(12, 12 + max(n, 15) + 5):
         for col in range(1, 21):
@@ -1677,32 +1746,52 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         _st(cs[addr], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
     for addr in ['B6','D6','F6','B8','F8','B9']:
         _st(cs[addr], font=BLK_NORM, fill=GREY_FILL, align=LEFT, border=_ab())
-    
-        # Freight from Part II C.Valuation col2 (INR)
+
+    # ── FIX 1: Supplier name from Part II Section B (3. SUPPLIER NAME & ADDRESS) ──
+    cs['B5'].value = meta.get('supplier', '')
+    _st(cs['B5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
+
+    # ── FIX 2: Exchange rate ──
+    cs['D5'].value = header.get('exchange_rate', 0)
+    _st(cs['D5'], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+
+    # ── FIX 3: Invoice No from Part I — I. INVOICE DETAILS SUMMARY col 2 ──
+    cs['F5'].value = meta.get('inv_no', '')
+    _st(cs['F5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
+
+    # ── FIX 4: Invoice Value in USD from Part II C.Valuation col 1 ──
+    cs['B7'].value = meta.get('inv_value', 0)
+    _st(cs['B7'], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+
+    # Invoice date
+    inv_date_raw = meta.get('inv_date', '')
+    cs['F7'].value = format_date(inv_date_raw) if inv_date_raw else ''
+    _st(cs['F7'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
+
+    # ── FIX 5: AWB NO from Part I D. MANIFEST DETAILS col 8 (HAWB NO) ──
+    cs['F9'].value = header.get('hawb_no', '')
+    _st(cs['F9'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
+
+    # Freight from Part II C.Valuation col2 (INR)
     cs['I5'].value = meta.get('freight', 0)
 
     # Insurance from Part II C.Valuation col3 (INR)
     cs['I6'].value = meta.get('insurance', 0)
 
     # Freight Charges - 2: misc charges from Part II D.Cost col13 (USD → INR)
-        # ── Freight Charges - 2 ──────────────────────────────────────────────────
     j5 = cs['J5']
     j5.value = 'Freight charges - 2'
     _st(j5, font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
 
-    # ALWAYS initialize k5, then set its value
     k5 = cs['K5']
-    # If the value is missing or 0, it will just show 0.00
     misc_inr_val = meta.get('misc_charges_inr', 0.0)
-    k5.value = misc_inr_val 
-    
-    # Apply the styling
+    k5.value = misc_inr_val
     _st(k5, font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
     for r in range(5, 11):
         cs.row_dimensions[r].height = 18
 
-        headers = {
+    headers = {
         1:'S.NO', 2:'DESCRIPTION OF GOODS', 3:'QTY', 4:'RATE (USD)',
         5:'VALUE (USD)', 6:'INR VALUE', 7:'CUSTOM DUTY PAID',
         8:'TOTAL EXPENSES / PCS', 9:'COST PER PIECE',
@@ -1762,8 +1851,8 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
 
         c = cs.cell(row=row, column=11); c.value = f'=C{row}*J{row}'
         _st(c, font=BLK_NORM, fill=PatternFill(fill_type=None), align=RIGHT, num_fmt=NUM_FMT, border=_ab())
-        
-                # L: F1 — Freight prorated
+
+        # L: F1 — Freight prorated
         c = cs.cell(row=row, column=12)
         c.value = f'=$I$5/$F${total_row}*F{row}'
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
@@ -1808,7 +1897,6 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         c.value = f"='D-DETAILS'!E{d_row}"
         _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        
         cs.row_dimensions[row].height = 18
 
     fr = first_row; lr = first_row + n - 1
@@ -1868,19 +1956,17 @@ def _fill_d_details(wb, items, duties, licences):
         if num_fmt: cell.number_format  = num_fmt
         if border:  cell.border         = border
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Build per-item sum of DEBIT DUTY from licence table
-    # lic_duty_per_item[itmsno] = total debit duty for that item
-    # ─────────────────────────────────────────────────────────────────────────
     lic_duty_per_item = defaultdict(float)
     for lic in licences:
         lic_duty_per_item[lic['itmsno']] += lic['debit_duty']
 
-    # BOE header
+    # ── FIX 6: BE No in D-DETAILS — write to a visible cell near top right ──
+    # Use H8 as before, but now we also write the BE No prominently
     be_no   = duties.get('_be_no', '')
     be_date = duties.get('_be_date', '')
+
     h8 = dd['H8']
-    h8.value = f'BOE NO: {be_no}   DATE: {be_date}'
+    h8.value = f'BOE NO: {be_no}'
     _style(h8, font=Font(name='Calibri', bold=True, size=11, color='1F3864'), align=LEFT)
 
     # Clear old rows
@@ -1915,13 +2001,9 @@ def _fill_d_details(wb, items, duties, licences):
         alt     = ALT1_FILL if sno % 2 == 0 else ALT2_FILL
         bcd_val = d.get('bcd', 0)
 
-        # SI NO
         c = dd.cell(row=row, column=2); c.value = sno
         _style(c, font=DATA_FONT, fill=alt, align=CENTER, border=_all_border())
 
-        # ── BCD column ───────────────────────────────────────────────────────
-        # BCD = 0 → write sum of DEBIT DUTY from licence table for this item
-        # BCD > 0 → write the parsed cash BCD value
         c = dd.cell(row=row, column=3)
         if bcd_val == 0 and sno in lic_duty_per_item:
             c.value = round(lic_duty_per_item[sno], 2)
@@ -1929,17 +2011,12 @@ def _fill_d_details(wb, items, duties, licences):
             c.value = bcd_val
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
-        # SWS
         c = dd.cell(row=row, column=4); c.value = d.get('sws', 0)
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
-        # IGST
         c = dd.cell(row=row, column=5); c.value = d.get('igst', 0)
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
-        # Paid / Cyber Receipt
-        # Licence-based BCD → not cash-paid, so receipt = SWS + IGST only
-        # Cash BCD → receipt = BCD + SWS + IGST
         c = dd.cell(row=row, column=6)
         if bcd_val == 0 and sno in lic_duty_per_item:
             c.value = f'=D{row}+E{row}'
@@ -1949,7 +2026,7 @@ def _fill_d_details(wb, items, duties, licences):
 
         dd.row_dimensions[row].height = 16
 
-    # Right table: licence entries (ITMSNO | LIC NO | DEBIT DUTY)
+    # Right table: licence entries
     for idx, lic in enumerate(licences):
         r   = 10 + idx
         alt = ALT1_FILL if idx % 2 == 0 else ALT2_FILL
@@ -2093,18 +2170,41 @@ if pdf_file:
                 for p in pdf.pages:
                     pages_text.append(p.extract_text() or "")
 
-            header = parse_header(pages_text[0])
-            ex_rate = header.get('exchange', 1.0)
-            hawb_no = parse_hawb(pages_text[0])
+            # ── Parse header from page 1 ──────────────────────────────────────
+            header  = parse_header(pages_text[0])
 
+            # ── FIX: use correct key 'exchange_rate' (not 'exchange') ─────────
+            ex_rate = header.get('exchange_rate', 1.0)
+
+            # ── FIX: Parse HAWB NO from Part I D. Manifest Details col 8 ─────
+            header['hawb_no'] = parse_hawb(pages_text[0])
+
+            # ── Build invoice text (pages between page 1 and PART III) ────────
             invoice_text = ''
             for _pg_txt in pages_text[1:]:
                 if 'PART - III' in _pg_txt:
                     break
                 invoice_text += _pg_txt + '\n'
+
             meta, items = parse_page2(invoice_text, ex_rate)
 
-            # Parse licences using positional word extraction (page object needed)
+            # ── INV NO + INV VALUE from Part I — I. INVOICE DETAILS SUMMARY ──
+            inv_summary = parse_invoice_summary(pages_text[0])
+            if inv_summary.get('inv_no'):
+                meta['inv_no'] = inv_summary['inv_no']
+            if inv_summary.get('inv_value'):
+                meta['inv_value'] = inv_summary['inv_value']  # Correct source: Part I col 3
+            elif not meta.get('inv_no'):
+                inv_no_p1 = parse_invoice_no(pages_text[0])
+                if inv_no_p1:
+                    meta['inv_no'] = inv_no_p1
+
+# ── Supplier name from Part II — B. TRANSACTING PARTIES ──────────
+            meta['supplier'] = parse_supplier(invoice_text)
+
+            
+
+            # Parse licences
             licences = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for pg_idx in range(5, len(pdf.pages)):
@@ -2113,7 +2213,7 @@ if pdf_file:
                     if lics:
                         licences.extend(lics)
 
-            # Deduplicate
+            # Deduplicate licences
             seen = set()
             unique_lics = []
             for lic in licences:
@@ -2123,7 +2223,7 @@ if pdf_file:
                     unique_lics.append(lic)
             licences = unique_lics
 
-                        # Extract Assess Values from Part III
+            # Extract Assess Values from Part III
             assess_values = {}
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 part3_pages = []
@@ -2138,9 +2238,9 @@ if pdf_file:
                         break
                 assess_values = extract_assess_values_from_pages(part3_pages)
 
-            
-
-            all_duties['_be_no']   = header.get('be_no', '')
+            # ── FIX: BE No comes from parse_header, pass to duties dict ──────
+            be_no_all = parse_be_no_from_pages(pages_text)
+            all_duties['_be_no']   = be_no_all or header.get('be_no', '')
             all_duties['_be_date'] = header.get('be_date', '')
 
         except Exception as e:
@@ -2156,6 +2256,14 @@ if pdf_file:
     c3.metric("Invoice Date",   meta.get('inv_date', '—'))
     c4.metric("Freight (₹)",   f"{meta.get('freight', '—'):,}" if meta.get('freight') else '—')
     c5.metric("Insurance (₹)", f"{meta.get('insurance', '—'):,}" if meta.get('insurance') else '—')
+
+    # Extra info row
+    c6, c7, c8, c9, c10 = st.columns(5)
+    c6.metric("Supplier",       meta.get('supplier', '—')[:25] if meta.get('supplier') else '—')
+    c7.metric("AWB / HAWB No",  header.get('hawb_no', '—'))
+    c8.metric("BE No",          header.get('be_no', '—'))
+    c9.metric("Inv Value (USD)",f"{meta.get('inv_value', '—'):,}" if meta.get('inv_value') else '—')
+    c10.metric("BE Date",       header.get('be_date', '—'))
 
     import pandas as pd
 
@@ -2193,7 +2301,6 @@ if pdf_file:
             st.info("ℹ️ No licence entries found")
 
     with tab4:
-        # Show exactly what BCD value will be written for each item
         lic_duty_per_item = defaultdict(float)
         for lic in licences:
             lic_duty_per_item[lic['itmsno']] += lic['debit_duty']
@@ -2256,8 +2363,9 @@ if pdf_file:
 
     st.markdown("""<div class="info-box">
     <b>What was filled:</b><br>
-    ✅ <b>C-SHEET</b>: All exchange rate, invoice, freight, item, duty and cost formulas<br>
-    ✅ <b>D-DETAILS</b>: BCD = sum of DEBIT DUTY (col 11) per item when BCD=0 ·
+    ✅ <b>C-SHEET</b>: Supplier · Exchange Rate · Invoice No · Invoice Value (USD) · 
+    Invoice Date · AWB/HAWB No · Freight · Insurance · All item/duty/cost formulas<br>
+    ✅ <b>D-DETAILS</b>: BOE No · BCD = sum of DEBIT DUTY (col 11) per item when BCD=0 ·
     SWS · IGST · Paid/Cyber Receipt · Licence right table · All totals
     </div>""", unsafe_allow_html=True)
 
