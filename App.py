@@ -1228,7 +1228,6 @@ def get_template_bytes() -> bytes:
 # PDF PARSERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def get_row_words(page, min_x: float = 60) -> dict:
     words = page.extract_words()
     rows = defaultdict(list)
@@ -1237,56 +1236,52 @@ def get_row_words(page, min_x: float = 60) -> dict:
             rows[round(w['top'])].append((w['x0'], w['text']))
     return {y: sorted(v, key=lambda x: x[0]) for y, v in rows.items()}
 
+
 def parse_be_no_from_pages(pages_text: list) -> str:
     for pg_text in pages_text:
-        # Pattern 1: "BE No\n<number>"
         m = re.search(r'BE\s*No\.?\s*\n\s*(\d{6,})', pg_text, re.IGNORECASE)
         if m:
             return m.group(1)
-        # Pattern 2: "BE No <number>" on same line
         m = re.search(r'BE\s*No\.?\s+(\d{6,})', pg_text, re.IGNORECASE)
         if m:
             return m.group(1)
-        # Pattern 3: "BE No" anywhere followed within 50 chars by a 7+ digit number
         m = re.search(r'BE\s*No.{0,50}?(\d{7,})', pg_text, re.IGNORECASE | re.DOTALL)
         if m:
             return m.group(1)
     return ""
 
+
 def parse_header(page1_text: str) -> dict:
+    """
+    FIX (Bug 8): BE No/BE Date label and value sit on separate lines in the
+    real PDF ("BE No BE Date\\nINMAA4 2124265 25/06/2026 H"), so matching
+    "BE No" immediately followed by digits never worked. Instead match the
+    data row directly: a 7-digit BE number followed by a date followed by
+    the single-letter BE Type ("H").
+    """
     info = {}
 
-    # Exchange rate
     m = re.search(r'1 USD=([\d.]+)INR', page1_text)
     if m:
         info['exchange_rate'] = float(m.group(1))
 
-    # BE No — appears in the header table as "BE No  8555370"
-    m = re.search(r'BE\s*No\s+(\d{6,})', page1_text)
+    m = re.search(r'\b(\d{7})\s+(\d{2}/\d{2}/\d{4})\s+[A-Z]\b', page1_text)
     if m:
         info['be_no'] = m.group(1)
-
-    # BE Date
-    m = re.search(r'(\d{2}/\d{2}/\d{4})\s+H\b', page1_text)
-    if m:
-        info['be_date'] = m.group(1)
+        info['be_date'] = m.group(2)
 
     return info
 
 
 def parse_hawb(page1_text: str) -> str:
-    # Pattern 1: date followed by 9+ digit number followed by date
     m = re.search(r'\d{2}/\d{2}/\d{4}\s+(\d{9,})\s+\d{2}/\d{2}/\d{4}', page1_text)
     if m:
         return m.group(1)
 
-    # Pattern 2: HAWB NO label with value nearby (same line or next line)
     m = re.search(r'HAWB\s*NO\s*[:\-]?\s*\n?\s*(\d{8,})', page1_text, re.IGNORECASE)
     if m:
         return m.group(1)
 
-    # Pattern 3: look for a standalone 11-digit number (HAWB is typically 11 digits)
-    # preceded by a date in the manifest block
     manifest_idx = page1_text.upper().find('MANIFEST')
     if manifest_idx != -1:
         block = page1_text[manifest_idx: manifest_idx + 800]
@@ -1298,7 +1293,25 @@ def parse_hawb(page1_text: str) -> str:
 
 
 def parse_supplier(page2_text: str) -> str:
-    # Pattern 1: name on next line after header
+    """
+    FIX (Bug 7): The "3.SUPPLIER NAME & ADDRESS" label gets extracted
+    separately from its data in this PDF's reading order (it ends up in the
+    rotated sidebar text). The actual supplier address block reliably lands
+    immediately after the "4.THIRD PARTY NAME & ADDRESS" label instead, with
+    one stray bled-in character appended to the first line (e.g.
+    "LINSOUL INC O") which we strip off.
+    """
+    m = re.search(
+        r'4\.\s*THIRD\s+PARTY\s+NAME\s*&\s*ADDRESS\s*\n\s*([^\n]+)',
+        page2_text, re.IGNORECASE
+    )
+    if m:
+        supplier = re.sub(r'\s+[A-Z]$', '', m.group(1)).strip()
+        if supplier:
+            return supplier
+
+    # Fallback to the old label-based patterns in case a different BOE layout
+    # doesn't have the "3.SUPPLIER" / "4.THIRD PARTY" bleed quirk.
     m = re.search(
         r'3\.?\s*SUPPLIER\s+NAME\s*[&A][\w\s]*ADDRESS\s*\n\s*([^\n]{3,})',
         page2_text, re.IGNORECASE
@@ -1308,103 +1321,142 @@ def parse_supplier(page2_text: str) -> str:
         if not re.match(r'^\d|^4\.', val):
             return val
 
-    # Pattern 2: name on same line, before "4." or end of line
-    m = re.search(
-        r'3\.?\s*SUPPLIER\s+NAME\s*[&A][\w\s]*ADDRESS\s+([A-Z][A-Za-z0-9\s\-\.&,]{3,?}?)(?:\s{3,}|\s*4\.|\s*\n)',
-        page2_text, re.IGNORECASE
-    )
-    if m:
-        return m.group(1).strip()
-
-    # Pattern 3: look for the label then grab everything up to next section number
-    m = re.search(
-        r'SUPPLIER\s+NAME[^0-9]{0,20}((?:[A-Z][A-Za-z0-9\s\-\.&,]){4,40})',
-        page2_text, re.IGNORECASE
-    )
-    if m:
-        return m.group(1).strip()
-
     return ""
 
 
 def parse_invoice_no(page1_text: str) -> str:
-    """
-    Extract Invoice No from Part I — I. INVOICE DETAILS - SUMMARY#
-    The table has columns: 1.S.NO | 2.INVOICE NO | 3.INV.AMT | 4.CUR
-    We want col 2 (INVOICE NO).
-    """
-    # After "1  " we expect the invoice number then amount then currency
     m = re.search(r'\bINVOICE\s+NO\b.*?\n\s*1\s+(\d{6,})', page1_text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1)
-    # Broader fallback: look for the summary line "1  02242026  4524.5  USD"
     m = re.search(r'^\s*1\s+(\d{6,})\s+[\d.]+\s+USD', page1_text, re.MULTILINE)
     if m:
         return m.group(1)
     return ""
 
-def parse_invoice_summary(page1_text: str) -> dict:
-    result = {}
 
-    # Find the INVOICE DETAILS section
-    idx = -1
-    for marker in ['INVOICE DETAILS - SUMMARY', 'INVOICE DETAILS', 'I. INVOICE']:
-        idx = page1_text.upper().find(marker)
-        if idx != -1:
-            break
+def parse_invoice_summary_multi(page1_text: str) -> list:
+    """
+    Part I, section I. INVOICE DETAILS - SUMMARY, read directly from page 1.
+    Handles BOEs with multiple invoices (this table lists every invoice on
+    the BOE with its number, amount and currency). Returns a list ordered
+    by S.NO, e.g.:
+        [{'sno': 1, 'inv_no': 'LSIN260417', 'inv_value': 2250.0, 'currency': 'USD'},
+         {'sno': 2, 'inv_no': 'LSIN26042503', 'inv_value': 56998.8, 'currency': 'USD'}]
+    """
+    invoices = []
+    idx = page1_text.find('2.INVOICE NO')
     if idx == -1:
-        return result
+        return invoices
 
-    block = page1_text[idx: idx + 600]
+    block = page1_text[idx:]
+    end = block.find('1.EVENT')
+    if end != -1:
+        block = block[:end]
 
-    # Try: data row with  1  <INV_NO>  <AMT>  USD  (flexible spacing)
-    m = re.search(r'\b1\s+(\S+)\s+([\d,]+\.?\d*)\s+USD', block, re.IGNORECASE)
-    if m:
-        result['inv_no']    = m.group(1).strip()
-        try:
-            result['inv_value'] = float(m.group(2).replace(',', ''))
-        except Exception:
-            pass
-        return result
+    for line in block.split('\n'):
+        m = re.search(r'(\d)\s+(\S+)\s+([\d,]+\.?\d*)\s+([A-Z]{3})\b', line)
+        if m:
+            invoices.append({
+                'sno': int(m.group(1)),
+                'inv_no': m.group(2),
+                'inv_value': float(m.group(3).replace(',', '')),
+                'currency': m.group(4),
+            })
+    return invoices
 
-    # Fallback: search entire page1 for the data row pattern
-    m = re.search(r'\b1\s+(\S+)\s+([\d,]+\.?\d*)\s+USD', page1_text, re.IGNORECASE)
-    if m:
-        result['inv_no']    = m.group(1).strip()
-        try:
-            result['inv_value'] = float(m.group(2).replace(',', ''))
-        except Exception:
-            pass
 
-    return result
+def parse_invoice_summary(page1_text: str) -> dict:
+    """Kept for backward compatibility — returns only the first invoice."""
+    invoices = parse_invoice_summary_multi(page1_text)
+    if invoices:
+        first = invoices[0]
+        return {'inv_no': first['inv_no'], 'inv_value': first['inv_value']}
+    return {}
+
+
+def group_pages_by_invoice(pages_text: list) -> list:
+    """
+    FIX (Bug 2): This BOE has multiple invoices, each restarting its own
+    item S.NO at 1 (e.g. invoice 1 has 1 item, invoice 2 has 74 items, and
+    both include an "item #1"). Concatenating every page into one blob and
+    parsing sequentially causes item numbers to collide across invoices,
+    silently overwriting Excel rows.
+
+    This groups PART-II pages by their "(Invoice N M)" header so each
+    invoice's items can be parsed and numbered independently, then combined
+    with a single running global row counter.
+
+    `pages_text` should be pages_text[1:] (i.e. everything after page 1),
+    and this function stops at the first page containing "PART - III".
+    """
+    blocks = []
+    cur_idx = None
+    cur_pages = []
+
+    for t in pages_text:
+        if 'PART - III' in t:
+            break
+        m = re.search(r'Invoice\s+(\d)\s+(\d)', t)
+        idx = int(m.group(1)) if m else cur_idx
+        if idx != cur_idx and cur_pages:
+            blocks.append((cur_idx, cur_pages))
+            cur_pages = []
+        cur_idx = idx
+        cur_pages.append(t)
+
+    if cur_pages:
+        blocks.append((cur_idx, cur_pages))
+
+    return blocks
+
 
 def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]]:
+    """
+    Parses ONE invoice block's text: header meta (invoice no/date, valuation,
+    misc charges) plus its item table.
+
+    FIX (Bug 1): item_pat previously hardcoded the unit "PCS" only, silently
+    dropping every item whose UQC is "SET" or "NOS" (7 items in the sample
+    BOE — Amp/Dac units and multi-pair bundles).
+    """
     meta = {}
 
-    # Invoice number from A. INVOICE section
-    m = re.search(r'\n1\s+(\d{6,})\s*\n', page2_text)
+    # FIX: invoice numbers in this BOE are alphanumeric (e.g. "LSIN26042503"),
+    # not purely numeric, and the leading S.NO before it varies (1, 2, ...)
+    # depending on which invoice this is — the old regex required both a
+    # literal leading "1" and a purely-numeric invoice number, so it never
+    # matched invoice 2 at all.
+    m = re.search(r'\n(\d)\s+([A-Z]{2,}\d{4,}|\d{6,})\s*\n', page2_text)
     if m:
-        meta['inv_no'] = m.group(1)
+        meta['inv_no'] = m.group(2)
 
-    # Invoice date
     m = re.search(r'(\d{2}-[A-Z]{3}-\d{2})', page2_text)
     if m:
         meta['inv_date'] = m.group(1)
 
-    # C. VALUATION section: INV VALUE (USD) | FREIGHT (INR) | INSURANCE (INR) ... DP
-    m = re.search(r'([\d.]+)\s+([\d]+)\s+([\d]+)\s+DP', page2_text)
+    # FIX: freight/insurance can have decimal points (e.g. "211716.59"), but
+    # the old pattern required the 2nd/3rd number groups to be pure digits,
+    # so any decimal freight/insurance value broke the whole match and
+    # freight/insurance/inv_value were silently left unset.
+    m = re.search(r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+DP', page2_text)
     if m:
-        meta['inv_value']  = float(m.group(1))   # USD total invoice value
-        meta['freight']    = float(m.group(2))   # Already in INR
-        meta['insurance']  = float(m.group(3))   # Already in INR
+        meta['inv_value'] = float(m.group(1))
+        meta['freight'] = float(m.group(2))
+        meta['insurance'] = float(m.group(3))
 
-    # D. COST & SERVICES — col 13 MISC CHARGE
+    # FIX: the old misc-charge search used a generic 300-char window after
+    # the word "MISC" and grabbed the first decimal number > 0.5 it found —
+    # which on invoices with no actual misc charge ended up grabbing an
+    # unrelated number further down the page (e.g. the ASS. VALUE total)
+    # and multiplying it by the exchange rate, producing a wildly wrong
+    # figure. Now the window is bounded strictly between the "13.MISC
+    # CHARGE" and "14.ASS. VALUE" labels, so an empty/blank misc charge
+    # correctly resolves to 0 instead of fabricating a huge number.
     meta['misc_charges_inr'] = 0.0
-    misc_idx = page2_text.upper().find('MISC')
+    misc_idx = page2_text.find('13.MISC CHARGE')
     if misc_idx != -1:
-    # Look in a window around the MISC label for a decimal number
-        window = page2_text[misc_idx: misc_idx + 300]
-    # Find all decimal numbers in the window, pick first one > 0
+        ass_idx = page2_text.find('14.ASS. VALUE', misc_idx)
+        window = page2_text[misc_idx: ass_idx] if ass_idx != -1 else page2_text[misc_idx: misc_idx + 60]
         nums = re.findall(r'\b(\d+\.\d+)\b', window)
         for n in nums:
             try:
@@ -1415,37 +1467,86 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
             except Exception:
                 pass
 
-    # Item parsing
     items = []
     item_pat = re.compile(
-        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]+\.[\d]{4,6})\s+([\d]+\.[\d]{4,6})\s+PCS\s+([\d]+\.[\d]+)',
+        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]+\.[\d]{4,6})\s+([\d]+\.[\d]{4,6})\s+(?:PCS|SET|NOS)\s+([\d]+\.[\d]+)',
         re.MULTILINE
     )
     for m in item_pat.finditer(page2_text):
-        sno  = int(m.group(1))
-        raw  = re.sub(r'\s+', ' ', m.group(2)).strip()
+        sno = int(m.group(1))
+        raw = re.sub(r'\s+', ' ', m.group(2)).strip()
         desc = re.sub(r'\b[A-Z]\b\s*', '', raw).strip()
-        for _b, _g in [('ACCESSORIESC','ACCESSORIES'),('ACCOESSORIES','ACCESSORIES'),
-                        ('HEADPHYONE','HEADPHONE'),('BLYACK','BLACK')]:
+        for _b, _g in [('ACCESSORIESC', 'ACCESSORIES'), ('ACCOESSORIES', 'ACCESSORIES'),
+                       ('HEADPHYONE', 'HEADPHONE'), ('BLYACK', 'BLACK')]:
             desc = desc.replace(_b, _g)
         end = m.end()
         nxt = page2_text[end:end + 150].strip().split('\n')[0].strip()
         if nxt and not re.match(r'^\d+\s+8', nxt) and 'GLOSSARY' not in nxt:
             combined = re.sub(r'\s+', ' ', desc + ' ' + nxt).strip()
             combined = re.sub(r'\b[A-Z]\b\s*', '', combined).strip()
-            for _b, _g in [('ACCESSORIESC','ACCESSORIES'),('ACCOESSORIES','ACCESSORIES'),
-                            ('HEADPHYONE','HEADPHONE'),('BLYACK','BLACK')]:
+            for _b, _g in [('ACCESSORIESC', 'ACCESSORIES'), ('ACCOESSORIES', 'ACCESSORIES'),
+                           ('HEADPHYONE', 'HEADPHONE'), ('BLYACK', 'BLACK')]:
                 combined = combined.replace(_b, _g)
             desc = combined
-        items.append({'sno': sno, 'desc': desc, 'price': float(m.group(3)), 'qty': float(m.group(4))})
+        items.append({'itemsn': sno, 'desc': desc, 'price': float(m.group(3)), 'qty': float(m.group(4))})
 
-    items.sort(key=lambda x: x['sno'])
+    items.sort(key=lambda x: x['itemsn'])
     return meta, items
 
 
+def parse_all_items(pages_text_after_p1: list, exchange_rate: float):
+    """
+    Groups pages by invoice, parses each invoice block's items, and assigns
+    a single running `global_sno` across all invoices (used for Excel row
+    placement) while keeping each item's original (invsno, itemsn) pair
+    (used to join duty / BCD data, since Part III/IV also key by INVSNO).
+
+    Returns: (meta_of_largest_invoice, all_items)
+    """
+    blocks = group_pages_by_invoice(pages_text_after_p1)
+
+    all_items = []
+    per_invoice_meta = {}
+    global_sno = 0
+
+    for invidx, pages in blocks:
+        block_text = '\n'.join(pages)
+        meta, items = parse_page2(block_text, exchange_rate)
+        meta['supplier'] = parse_supplier(block_text)
+        per_invoice_meta[invidx] = (meta, len(items))
+
+        for it in items:
+            global_sno += 1
+            it['global_sno'] = global_sno
+            it['invsno'] = invidx
+            all_items.append(it)
+
+    # Use the invoice with the most items as the "primary" one for the
+    # single-invoice header fields on C-SHEET (supplier, invoice no/value,
+    # freight, insurance). Adjust this choice if your workflow should
+    # instead always use invoice 1, or should produce one C-SHEET per
+    # invoice.
+    if per_invoice_meta:
+        primary_idx = max(per_invoice_meta, key=lambda k: per_invoice_meta[k][1])
+        primary_meta = per_invoice_meta[primary_idx][0]
+    else:
+        primary_meta = {}
+
+    return primary_meta, all_items
+
+
 def extract_assess_values_from_pages(pdf_pages) -> dict:
-    """Extract 29.ASSESS VALUE for each item from Part III pages."""
+    """
+    Extract 29.ASSESS VALUE for each item from Part III pages.
+
+    FIX (Bug 3/4): the row-detection regex hardcoded invoice number "1" and
+    the literal "NOEXCISE" spelling. The real PDF alternates between
+    "NOEXCISE" and "NOEXECISE" (typo variant) and has items belonging to
+    invoice "2" as well. Now returns a dict keyed by (invsno, itemsn).
+    """
     assess = {}
+    row_pat = re.compile(r'(?:^|\s)(\d)\s+(\d{1,2})\s+\d{7,}\s+NOEX(?:C|EC)ISE')
+
     for page in pdf_pages:
         pg_text = page.extract_text() or ''
         if 'PART - III' not in pg_text and 'PART III' not in pg_text:
@@ -1459,14 +1560,14 @@ def extract_assess_values_from_pages(pdf_pages) -> dict:
         for i, y in enumerate(sorted_ys):
             words = row_words[y]
             texts = [t for _, t in words]
-            line  = ' '.join(texts)
-            m = re.match(r'^1\s+(\d{1,2})\s+\d{7,}\s+NOEX', line)
+            line = ' '.join(texts)
+            m = row_pat.search(line)
             if not m:
                 continue
-            sno = int(m.group(1))
+            invsno, itemsn = int(m.group(1)), int(m.group(2))
 
             for j in range(i + 1, min(i + 15, len(sorted_ys))):
-                y2     = sorted_ys[j]
+                y2 = sorted_ys[j]
                 words2 = row_words[y2]
                 texts2 = [t for _, t in words2]
                 nums = [t for t in texts2 if re.match(r'^\d{3,}\.?\d*$', t)]
@@ -1474,7 +1575,7 @@ def extract_assess_values_from_pages(pdf_pages) -> dict:
                     try:
                         assess_val = float(nums[-2])
                         if assess_val > 100:
-                            assess[sno] = assess_val
+                            assess[(invsno, itemsn)] = assess_val
                             break
                     except Exception:
                         pass
@@ -1482,20 +1583,32 @@ def extract_assess_values_from_pages(pdf_pages) -> dict:
 
 
 def extract_duties_from_page(page) -> dict:
-    row_words = get_row_words(page)
+    """
+    FIX (Bug 3/4/5):
+      - row_pat now captures invsno as a group instead of hardcoding "1",
+        and matches both "NOEXCISE" and "NOEXECISE".
+      - the search for the item's duty "Amount" row now uses an absolute
+        vertical-distance window (120pt) instead of a fixed row-count
+        window, because rotated sidebar text injects extra single-character
+        junk rows that were pushing the real Amount row out of range.
+    Returns a dict keyed by (invsno, itemsn).
+    """
+    row_words = get_row_words(page, min_x=0)
     sorted_ys = sorted(row_words.keys())
     duties = {}
+    row_pat = re.compile(r'(?:^|\s)(\d)\s+(\d{1,2})\s+\d{7,9}\s+NOEX(?:C|EC)ISE')
 
     for i, y in enumerate(sorted_ys):
         texts = [t for _, t in row_words[y]]
-        line  = ' '.join(texts)
-        m = re.match(r'^1\s+(\d+)\s+\d{7,}\s+NOEX[CE]+ISE', line)
+        line = ' '.join(texts)
+        m = row_pat.search(line)
         if not m:
             continue
-        sno = int(m.group(1))
+        invsno, itemsn = int(m.group(1)), int(m.group(2))
 
-        for j in range(i + 1, min(i + 20, len(sorted_ys))):
-            y2     = sorted_ys[j]
+        for y2 in sorted_ys:
+            if y2 <= y or y2 - y > 120:
+                continue
             words2 = row_words[y2]
             if not words2 or words2[0][1] != 'Amount':
                 continue
@@ -1511,9 +1624,9 @@ def extract_duties_from_page(page) -> dict:
                 except Exception:
                     return 0.0
 
-            duties[sno] = {
-                'bcd':  join_num(nums_in(100, 170)),
-                'sws':  join_num(nums_in(195, 240)),
+            duties[(invsno, itemsn)] = {
+                'bcd': join_num(nums_in(100, 170)),
+                'sws': join_num(nums_in(195, 240)),
                 'igst': join_num(nums_in(295, 340)),
             }
             break
@@ -1521,151 +1634,84 @@ def extract_duties_from_page(page) -> dict:
     return duties
 
 
+def parse_scheme_g(page) -> dict:
+    """
+    FIX (Bug 6): Part IV, Section G "SCHEME NOTIFICATION AND DUTY FOREGONE
+    DETAILS" gives one row per item with a pre-summed "BCD AMT FG" value —
+    already correctly totalled even when an item's BCD was paid via two
+    different licences. This is far more robust than reconstructing the sum
+    from the multi-page F. LICENCE DETAILS table.
+
+    Continuation pages don't repeat the section header, so we scan any page
+    containing the scheme code "ROSCTL" (or "GNX..." for GNX100 items)
+    rather than gating on the header text. Token x-positions are matched by
+    tolerance rather than by list position, since rotated sidebar text
+    sometimes inserts an extra low-x garbage token that shifts word order.
+
+    Returns a dict keyed by (invsno, itemsn) -> bcd_amt_forgone (float).
+    """
+    result = {}
+    row_words = get_row_words(page, min_x=0)
+
+    for y in sorted(row_words.keys()):
+        words = row_words[y]
+        line = ' '.join(t for _, t in words)
+        if 'ROSCTL' not in line and 'GNX' not in line:
+            continue
+
+        invsno = itmsno = bcd_fg = None
+        for x, t in words:
+            if 70 <= x <= 90 and re.match(r'^\d+$', t):
+                invsno = int(t)
+            elif 105 <= x <= 130 and re.match(r'^\d+$', t):
+                itmsno = int(t)
+            elif 440 <= x <= 505 and re.match(r'^[\d.]+$', t):
+                bcd_fg = float(t)
+
+        if invsno is not None and itmsno is not None and bcd_fg is not None:
+            result[(invsno, itmsno)] = bcd_fg
+
+    return result
+
+
 def parse_licences_from_page(page) -> list[dict]:
     """
-    Extract F. LICENCE DETAILS rows using word x-positions.
+    Kept only as an optional reference source for licence NUMBERS shown in
+    D-DETAILS' right-hand table (not for computing BCD amounts — use
+    parse_scheme_g for that, it's the reliable source).
     """
     licences = []
-
     page_text = page.extract_text() or ''
-    if 'LICENCE DETAILS' not in page_text:
+    if 'LICENCE DETAILS' not in page_text and 'ROSCTL' not in page_text:
         return licences
 
     row_words = get_row_words(page, min_x=0)
-    sorted_ys = sorted(row_words.keys())
-
-    header_y   = None
-    col_bounds = {}
-
-    for y in sorted_ys:
+    for y in sorted(row_words.keys()):
         words = row_words[y]
         texts = [t for _, t in words]
-        line  = ' '.join(texts)
-        if 'ITMSNO' in line or ('DEBIT' in line and 'DUTY' in line):
-            header_y = y
-            for x, t in words:
-                col_bounds[t] = x
-            break
-
-    if header_y is None:
-        return _parse_licences_text_fallback(page_text)
-
-    header_words = row_words[header_y]
-    duty_x = max(x for x, _ in header_words)
-
-    itmsno_x = None
-    for x, t in header_words:
-        if 'ITMSNO' in t or t == '2.ITMSNO':
-            itmsno_x = x
-            break
-    if itmsno_x is None and len(header_words) >= 2:
-        itmsno_x = sorted(x for x, _ in header_words)[1]
-
-    reading = False
-    for y in sorted_ys:
-        if y == header_y:
-            reading = True
+        line = ' '.join(texts)
+        m = re.search(r'(?:^|\s)(\d)\s+(\d{1,2})\s+1\s+(\d{9,})\s+\d{2}-[A-Z]{3}-\d{2}\s+RS', line)
+        if not m:
             continue
-        if not reading:
-            continue
-
-        words = row_words[y]
-        if not words:
-            continue
-
-        texts_only = [t for _, t in words]
-        line = ' '.join(texts_only)
-
-        if any(kw in line for kw in ['SCHEME NOTIFICATION', 'PART -', 'PART-', 'G. SCHEME']):
-            break
-
-        first_text = texts_only[0]
-        if first_text != '1':
-            continue
-
-        if len(words) < 4:
-            continue
-
-        numeric_tokens = [(x, t) for x, t in words if re.match(r'^[\d.]+$', t)]
-        if len(numeric_tokens) < 2:
-            continue
-
-        itmsno_val = numeric_tokens[1][1]
-        try:
-            itmsno = int(itmsno_val)
-        except ValueError:
-            continue
-
-        last_numeric = numeric_tokens[-1][1]
-        try:
-            debit_duty = float(last_numeric)
-        except ValueError:
-            continue
-
-        if debit_duty <= 0:
-            continue
-
-        lic_no = ''
-        for _, t in words:
-            cleaned = re.sub(r'[^0-9]', '', t)
-            if len(cleaned) >= 9:
-                lic_no = cleaned
-                break
-
-        licences.append({
-            'itmsno':     itmsno,
-            'lic_no':     lic_no,
-            'debit_duty': debit_duty,
-        })
-
-    return licences
-
-
-def _parse_licences_text_fallback(page_text: str) -> list[dict]:
-    licences = []
-    idx = page_text.find('LICENCE DETAILS')
-    if idx == -1:
-        return licences
-
-    block = page_text[idx: idx + 6000]
-    lines = block.split('\n')
-
-    for line in lines:
-        parts = line.strip().split()
-        if not parts or parts[0] != '1' or len(parts) < 6:
-            continue
-        try:
-            itmsno = int(parts[1])
-        except (ValueError, IndexError):
-            continue
-
-        try:
-            debit_duty = float(parts[-1])
-        except (ValueError, IndexError):
-            continue
-
-        if debit_duty <= 0:
-            continue
-
-        lic_no = ''
-        for p in parts:
-            cleaned = re.sub(r'[^0-9]', '', p)
-            if len(cleaned) >= 9:
-                lic_no = cleaned
-                break
-
-        licences.append({
-            'itmsno':     itmsno,
-            'lic_no':     lic_no,
-            'debit_duty': debit_duty,
-        })
-
+        invsno, itmsno, lic_no = int(m.group(1)), int(m.group(2)), m.group(3)
+        debit_duty = None
+        nums = [t for _, t in words if re.match(r'^[\d.]+$', t)]
+        if nums:
+            try:
+                debit_duty = float(nums[-1])
+            except ValueError:
+                pass
+        if debit_duty and debit_duty > 0:
+            licences.append({
+                'invsno': invsno, 'itmsno': itmsno,
+                'lic_no': lic_no, 'debit_duty': debit_duty,
+            })
     return licences
 
 
 def format_date(raw: str) -> str:
-    mon = {'JAN':'01','FEB':'02','MAR':'03','APR':'04','MAY':'05','JUN':'06',
-           'JUL':'07','AUG':'08','SEP':'09','OCT':'10','NOV':'11','DEC':'12'}
+    mon = {'JAN': '01', 'FEB': '02', 'MAR': '03', 'APR': '04', 'MAY': '05', 'JUN': '06',
+           'JUL': '07', 'AUG': '08', 'SEP': '09', 'OCT': '10', 'NOV': '11', 'DEC': '12'}
     m = re.match(r'(\d{1,2})-([A-Z]{3})-(\d{2})$', raw.upper())
     if m:
         return f"{m.group(1).zfill(2)}.{mon.get(m.group(2), '??')}.20{m.group(3)}"
@@ -1679,11 +1725,11 @@ def format_date(raw: str) -> str:
 # EXCEL FILLER
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def fill_excel(header: dict, meta: dict, items: list, duties: dict, licences: list, assess_values: dict = None) -> bytes:
+def fill_excel(header: dict, meta: dict, items: list, duties: dict,
+                bcd_forgone: dict, licences: list, assess_values: dict = None) -> bytes:
     wb = load_workbook(io.BytesIO(get_template_bytes()))
     _fill_c_sheet(wb, header, meta, items, duties, assess_values or {})
-    _fill_d_details(wb, items, duties, licences)
+    _fill_d_details(wb, items, duties, bcd_forgone, licences)
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -1693,42 +1739,42 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     cs = wb['C-SHEET']
-    n  = len(items)
+    n = len(items)
     exchange_rate = header.get('exchange_rate', 1.0)
 
     def _s(style='thin'): return Side(style=style, color='000000')
-    def _ab(): s=_s(); return Border(left=s, right=s, top=s, bottom=s)
-    def _mb(): s=_s('medium'); return Border(left=s, right=s, top=s, bottom=s)
+    def _ab(): s = _s(); return Border(left=s, right=s, top=s, bottom=s)
+    def _mb(): s = _s('medium'); return Border(left=s, right=s, top=s, bottom=s)
 
-    NAVY_FILL  = PatternFill('solid', fgColor='1F3864')
+    NAVY_FILL = PatternFill('solid', fgColor='1F3864')
     GREEN_FILL = PatternFill('solid', fgColor='92D050')
-    PINK_FILL  = PatternFill('solid', fgColor='D99594')
-    TEAL_FILL  = PatternFill('solid', fgColor='31859B')
-    GREY_FILL  = PatternFill('solid', fgColor='D8D8D8')
-    SUM_FILL   = PatternFill('solid', fgColor='BDD7EE')
-    HDR_FILL   = PatternFill('solid', fgColor='2E75B6')
+    PINK_FILL = PatternFill('solid', fgColor='D99594')
+    TEAL_FILL = PatternFill('solid', fgColor='31859B')
+    GREY_FILL = PatternFill('solid', fgColor='D8D8D8')
+    SUM_FILL = PatternFill('solid', fgColor='BDD7EE')
+    HDR_FILL = PatternFill('solid', fgColor='2E75B6')
     EXTRA_FILL = PatternFill('solid', fgColor='E2EFDA')
-    ASSESS_FILL= PatternFill('solid', fgColor='FFF2CC')
+    ASSESS_FILL = PatternFill('solid', fgColor='FFF2CC')
 
-    WHT_BOLD = Font(name='Calibri', bold=True,  color='FFFFFF', size=10)
-    BLK_BOLD = Font(name='Calibri', bold=True,  color='000000', size=10)
+    WHT_BOLD = Font(name='Calibri', bold=True, color='FFFFFF', size=10)
+    BLK_BOLD = Font(name='Calibri', bold=True, color='000000', size=10)
     BLK_NORM = Font(name='Calibri', bold=False, color='000000', size=10)
-    NUM_FMT  = '#,##0.00'
-    CENTER   = Alignment(horizontal='center', vertical='center', wrap_text=False)
-    LEFT     = Alignment(horizontal='left',   vertical='center', wrap_text=False)
-    RIGHT    = Alignment(horizontal='right',  vertical='center', wrap_text=False)
+    NUM_FMT = '#,##0.00'
+    CENTER = Alignment(horizontal='center', vertical='center', wrap_text=False)
+    LEFT = Alignment(horizontal='left', vertical='center', wrap_text=False)
+    RIGHT = Alignment(horizontal='right', vertical='center', wrap_text=False)
 
     def _st(cell, font=None, fill=None, align=None, num_fmt=None, border=None):
-        if font:    cell.font          = font
-        if fill:    cell.fill          = fill
-        if align:   cell.alignment     = align
-        if border:  cell.border        = border
+        if font: cell.font = font
+        if fill: cell.fill = fill
+        if align: cell.alignment = align
+        if border: cell.border = border
         if num_fmt: cell.number_format = num_fmt
 
-    for col, w in [('A',7),('B',40),('C',7),('D',10),('E',12),
-               ('F',16),('G',16),('H',16),('I',16),('J',13),('K',13),
-               ('L',14),('M',14),('N',12),('O',16),('P',18),('Q',12),
-               ('R',14),('S',12),('T',14)]:
+    for col, w in [('A', 7), ('B', 40), ('C', 7), ('D', 10), ('E', 12),
+                   ('F', 16), ('G', 16), ('H', 16), ('I', 16), ('J', 13), ('K', 13),
+                   ('L', 14), ('M', 14), ('N', 12), ('O', 16), ('P', 18), ('Q', 12),
+                   ('R', 14), ('S', 12), ('T', 14)]:
         cs.column_dimensions[col].width = w
 
     for row in range(12, 12 + max(n, 15) + 5):
@@ -1738,47 +1784,37 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
             c.font = Font(name='Calibri', size=10); c.border = Border()
             c.alignment = Alignment(); c.number_format = 'General'
 
-    for addr in ['A5','C5','E5','H5','A6','C6','E6','H6',
-                 'A7','E7','H7','A8','E8','H8','A9','E9']:
+    for addr in ['A5', 'C5', 'E5', 'H5', 'A6', 'C6', 'E6', 'H6',
+                 'A7', 'E7', 'H7', 'A8', 'E8', 'H8', 'A9', 'E9']:
         _st(cs[addr], font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
 
-    for addr in ['B5','D5','F5','I5','I6','B7','F7','I7','F9','I8']:
+    for addr in ['B5', 'D5', 'F5', 'I5', 'I6', 'B7', 'F7', 'I7', 'F9', 'I8']:
         _st(cs[addr], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
-    for addr in ['B6','D6','F6','B8','F8','B9']:
+    for addr in ['B6', 'D6', 'F6', 'B8', 'F8', 'B9']:
         _st(cs[addr], font=BLK_NORM, fill=GREY_FILL, align=LEFT, border=_ab())
 
-    # ── FIX 1: Supplier name from Part II Section B (3. SUPPLIER NAME & ADDRESS) ──
     cs['B5'].value = meta.get('supplier', '')
     _st(cs['B5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    # ── FIX 2: Exchange rate ──
     cs['D5'].value = header.get('exchange_rate', 0)
     _st(cs['D5'], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
-    # ── FIX 3: Invoice No from Part I — I. INVOICE DETAILS SUMMARY col 2 ──
     cs['F5'].value = meta.get('inv_no', '')
     _st(cs['F5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    # ── FIX 4: Invoice Value in USD from Part II C.Valuation col 1 ──
     cs['B7'].value = meta.get('inv_value', 0)
     _st(cs['B7'], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
-    # Invoice date
     inv_date_raw = meta.get('inv_date', '')
     cs['F7'].value = format_date(inv_date_raw) if inv_date_raw else ''
     _st(cs['F7'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    # ── FIX 5: AWB NO from Part I D. MANIFEST DETAILS col 8 (HAWB NO) ──
     cs['F9'].value = header.get('hawb_no', '')
     _st(cs['F9'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    # Freight from Part II C.Valuation col2 (INR)
     cs['I5'].value = meta.get('freight', 0)
-
-    # Insurance from Part II C.Valuation col3 (INR)
     cs['I6'].value = meta.get('insurance', 0)
 
-    # Freight Charges - 2: misc charges from Part II D.Cost col13 (USD → INR)
     j5 = cs['J5']
     j5.value = 'Freight charges - 2'
     _st(j5, font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
@@ -1792,13 +1828,13 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         cs.row_dimensions[r].height = 18
 
     headers = {
-        1:'S.NO', 2:'DESCRIPTION OF GOODS', 3:'QTY', 4:'RATE (USD)',
-        5:'VALUE (USD)', 6:'INR VALUE', 7:'CUSTOM DUTY PAID',
-        8:'TOTAL EXPENSES / PCS', 9:'COST PER PIECE',
-        10:'+2% MARGIN', 11:'TOTAL COST',
-        12:'F1', 13:'F2', 14:'insurance',
-        15:'Assess Value', 16:'Assess Value as per BOE', 17:'Difference',
-        18:'Custom', 19:'Swc', 20:'Igst',
+        1: 'S.NO', 2: 'DESCRIPTION OF GOODS', 3: 'QTY', 4: 'RATE (USD)',
+        5: 'VALUE (USD)', 6: 'INR VALUE', 7: 'CUSTOM DUTY PAID',
+        8: 'TOTAL EXPENSES / PCS', 9: 'COST PER PIECE',
+        10: '+2% MARGIN', 11: 'TOTAL COST',
+        12: 'F1', 13: 'F2', 14: 'insurance',
+        15: 'Assess Value', 16: 'Assess Value as per BOE', 17: 'Difference',
+        18: 'Custom', 19: 'Swc', 20: 'Igst',
     }
     for col, txt in headers.items():
         c = cs.cell(row=11, column=col)
@@ -1812,11 +1848,15 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     first_row = 12
     total_row = first_row + n
 
+    # FIX (Bug 2): row placement now uses each item's `global_sno` (unique
+    # across all invoices on this BOE) instead of the per-invoice `itemsn`,
+    # which previously collided when multiple invoices restart at S.NO 1.
     for it in items:
-        row   = first_row + it['sno'] - 1
-        d_row = 9 + it['sno']
+        gsno = it['global_sno']
+        row = first_row + gsno - 1
+        key = (it['invsno'], it['itemsn'])
 
-        c = cs.cell(row=row, column=1); c.value = it['sno']
+        c = cs.cell(row=row, column=1); c.value = gsno
         _st(c, font=BLK_BOLD, fill=GREEN_FILL, align=CENTER, border=_ab())
 
         c = cs.cell(row=row, column=2); c.value = it['desc']
@@ -1837,7 +1877,7 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
         c = cs.cell(row=row, column=7)
-        c.value = f"='D-DETAILS'!C{d_row}+'D-DETAILS'!D{d_row}"
+        c.value = f"='D-DETAILS'!C{row - 2}+'D-DETAILS'!D{row - 2}"
         _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
         c = cs.cell(row=row, column=8); c.value = f'=+$I$9/$F${total_row}*F{row}'
@@ -1852,49 +1892,40 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
         c = cs.cell(row=row, column=11); c.value = f'=C{row}*J{row}'
         _st(c, font=BLK_NORM, fill=PatternFill(fill_type=None), align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # L: F1 — Freight prorated
         c = cs.cell(row=row, column=12)
         c.value = f'=$I$5/$F${total_row}*F{row}'
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # M: F2 — Freight charges-2 prorated
         c = cs.cell(row=row, column=13)
         c.value = f'=$K$5/$F${total_row}*F{row}'
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # N: insurance prorated
         c = cs.cell(row=row, column=14)
         c.value = f'=$I$6/$F${total_row}*F{row}'
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # O: Assess Value (calculated) = INR + F1 + F2 + insurance
         c = cs.cell(row=row, column=15)
         c.value = f'=F{row}+L{row}+M{row}+N{row}'
         _st(c, font=BLK_NORM, fill=PINK_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # P: Assess Value as per BOE (from PDF Part III col 29)
         c = cs.cell(row=row, column=16)
-        c.value = assess_values.get(it['sno'], 0.0)
+        c.value = assess_values.get(key, 0.0)
         _st(c, font=BLK_BOLD, fill=ASSESS_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # Q: Difference
         c = cs.cell(row=row, column=17)
         c.value = f'=O{row}-P{row}'
         _st(c, font=BLK_NORM, fill=PatternFill(fill_type=None), align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # R: Custom (BCD from D-DETAILS)
         c = cs.cell(row=row, column=18)
-        c.value = f"='D-DETAILS'!C{d_row}"
+        c.value = f"='D-DETAILS'!C{row - 2}"
         _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # S: Swc (SWS from D-DETAILS)
         c = cs.cell(row=row, column=19)
-        c.value = f"='D-DETAILS'!D{d_row}"
+        c.value = f"='D-DETAILS'!D{row - 2}"
         _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
-        # T: Igst (IGST from D-DETAILS)
         c = cs.cell(row=row, column=20)
-        c.value = f"='D-DETAILS'!E{d_row}"
+        c.value = f"='D-DETAILS'!E{row - 2}"
         _st(c, font=BLK_NORM, fill=TEAL_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_ab())
 
         cs.row_dimensions[row].height = 18
@@ -1920,12 +1951,12 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     cs.row_dimensions[total_row].height = 20
 
 
-def _fill_d_details(wb, items, duties, licences):
+def _fill_d_details(wb, items, duties, bcd_forgone, licences):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
     dd = wb['D-DETAILS']
-    n  = len(items)
+    n = len(items)
 
     def _side(style='thin'): return Side(style=style, color='000000')
     def _all_border():
@@ -1933,43 +1964,40 @@ def _fill_d_details(wb, items, duties, licences):
 
     HEADER_FILL = PatternFill('solid', fgColor='1F3864')
     HEADER_FONT = Font(name='Calibri', bold=True, color='FFFFFF', size=10)
-    ALT1_FILL   = PatternFill('solid', fgColor='DEEAF1')
-    ALT2_FILL   = PatternFill('solid', fgColor='FFFFFF')
-    SUM_FILL    = PatternFill('solid', fgColor='BDD7EE')
-    SUM_FONT    = Font(name='Calibri', bold=True, size=10)
-    LBL_FILL    = PatternFill('solid', fgColor='FFF2CC')
-    LBL_FONT    = Font(name='Calibri', bold=True, size=10)
-    BRK_FILL    = PatternFill('solid', fgColor='E2EFDA')
-    BRK_FONT    = Font(name='Calibri', bold=True, size=10)
-    DATA_FONT   = Font(name='Calibri', size=10)
-    LIC_FILL    = PatternFill('solid', fgColor='FCE4D6')
-    LIC_FONT    = Font(name='Calibri', bold=True, size=10)
-    NUM_FMT     = '#,##0.00'
-    CENTER      = Alignment(horizontal='center', vertical='center', wrap_text=False)
-    LEFT        = Alignment(horizontal='left',   vertical='center', wrap_text=False)
-    RIGHT       = Alignment(horizontal='right',  vertical='center', wrap_text=False)
+    ALT1_FILL = PatternFill('solid', fgColor='DEEAF1')
+    ALT2_FILL = PatternFill('solid', fgColor='FFFFFF')
+    SUM_FILL = PatternFill('solid', fgColor='BDD7EE')
+    SUM_FONT = Font(name='Calibri', bold=True, size=10)
+    LBL_FILL = PatternFill('solid', fgColor='FFF2CC')
+    LBL_FONT = Font(name='Calibri', bold=True, size=10)
+    BRK_FILL = PatternFill('solid', fgColor='E2EFDA')
+    BRK_FONT = Font(name='Calibri', bold=True, size=10)
+    DATA_FONT = Font(name='Calibri', size=10)
+    LIC_FILL = PatternFill('solid', fgColor='FCE4D6')
+    LIC_FONT = Font(name='Calibri', bold=True, size=10)
+    NUM_FMT = '#,##0.00'
+    CENTER = Alignment(horizontal='center', vertical='center', wrap_text=False)
+    LEFT = Alignment(horizontal='left', vertical='center', wrap_text=False)
+    RIGHT = Alignment(horizontal='right', vertical='center', wrap_text=False)
 
     def _style(cell, font=None, fill=None, align=None, num_fmt=None, border=None):
-        if font:    cell.font           = font
-        if fill:    cell.fill           = fill
-        if align:   cell.alignment      = align
-        if num_fmt: cell.number_format  = num_fmt
-        if border:  cell.border         = border
+        if font: cell.font = font
+        if fill: cell.fill = fill
+        if align: cell.alignment = align
+        if num_fmt: cell.number_format = num_fmt
+        if border: cell.border = border
 
-    lic_duty_per_item = defaultdict(float)
+    # licence numbers keyed by (invsno, itmsno), for reference display only
+    lic_no_per_item = {}
     for lic in licences:
-        lic_duty_per_item[lic['itmsno']] += lic['debit_duty']
+        key = (lic['invsno'], lic['itmsno'])
+        lic_no_per_item.setdefault(key, lic['lic_no'])
 
-    # ── FIX 6: BE No in D-DETAILS — write to a visible cell near top right ──
-    # Use H8 as before, but now we also write the BE No prominently
-    be_no   = duties.get('_be_no', '')
-    be_date = duties.get('_be_date', '')
-
+    be_no = duties.get('_be_no', '')
     h8 = dd['H8']
     h8.value = f'BOE NO: {be_no}'
     _style(h8, font=Font(name='Calibri', bold=True, size=11, color='1F3864'), align=LEFT)
 
-    # Clear old rows
     clear_to = 10 + max(n, 10) + 40
     for row in range(9, clear_to):
         for col in range(1, 12):
@@ -1979,36 +2007,41 @@ def _fill_d_details(wb, items, duties, licences):
             c.alignment = Alignment(); c.number_format = 'General'
 
     item_data_start = 10
-    item_data_end   = 10 + n - 1
+    item_data_end = 10 + n - 1
 
-    col_widths = {2:6, 3:14, 4:12, 5:12, 6:16, 7:2, 8:6, 9:16, 10:14}
+    col_widths = {2: 6, 3: 14, 4: 12, 5: 12, 6: 16, 7: 2, 8: 6, 9: 16, 10: 14}
     for col, w in col_widths.items():
         dd.column_dimensions[get_column_letter(col)].width = w
 
-    # Header row 9
-    headers_left  = {2:'SI NO', 3:'BCD / LICENSE', 4:'SWS', 5:'IGST', 6:'Paid / Cyber Receipt'}
-    headers_right = {8:'SI NO', 9:'LICENCE NO', 10:'DEBIT DUTY'}
+    headers_left = {2: 'SI NO', 3: 'BCD / LICENSE', 4: 'SWS', 5: 'IGST', 6: 'Paid / Cyber Receipt'}
+    headers_right = {8: 'SI NO', 9: 'LICENCE NO', 10: 'DEBIT DUTY'}
     for col, txt in {**headers_left, **headers_right}.items():
         c = dd.cell(row=9, column=col); c.value = txt
         _style(c, font=HEADER_FONT, fill=HEADER_FILL, align=CENTER, border=_all_border())
     dd.row_dimensions[9].height = 20
 
-    # Item rows
-    for it in items:
-        sno     = it['sno']
-        row     = 9 + sno
-        d       = duties.get(sno, {})
-        alt     = ALT1_FILL if sno % 2 == 0 else ALT2_FILL
-        bcd_val = d.get('bcd', 0)
+    # FIX (Bug 2 + Bug 6): rows are placed by global_sno; BCD comes from
+    # Part IV Section G (bcd_forgone, keyed by (invsno,itemsn)) rather than
+    # from re-summing the licence table — this is the reliable source and
+    # already accounts for items split across multiple licences.
+    for idx, it in enumerate(items):
+        gsno = it['global_sno']
+        row = 9 + gsno
+        key = (it['invsno'], it['itemsn'])
+        d = duties.get(key, {})
+        alt = ALT1_FILL if gsno % 2 == 0 else ALT2_FILL
 
-        c = dd.cell(row=row, column=2); c.value = sno
+        bcd_paid = d.get('bcd', 0)
+        bcd_fg = bcd_forgone.get(key)
+
+        c = dd.cell(row=row, column=2); c.value = gsno
         _style(c, font=DATA_FONT, fill=alt, align=CENTER, border=_all_border())
 
         c = dd.cell(row=row, column=3)
-        if bcd_val == 0 and sno in lic_duty_per_item:
-            c.value = round(lic_duty_per_item[sno], 2)
+        if bcd_paid == 0 and bcd_fg:
+            c.value = round(bcd_fg, 2)
         else:
-            c.value = bcd_val
+            c.value = bcd_paid
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
         c = dd.cell(row=row, column=4); c.value = d.get('sws', 0)
@@ -2018,7 +2051,7 @@ def _fill_d_details(wb, items, duties, licences):
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
         c = dd.cell(row=row, column=6)
-        if bcd_val == 0 and sno in lic_duty_per_item:
+        if bcd_paid == 0 and bcd_fg:
             c.value = f'=D{row}+E{row}'
         else:
             c.value = f'=C{row}+D{row}+E{row}'
@@ -2026,31 +2059,19 @@ def _fill_d_details(wb, items, duties, licences):
 
         dd.row_dimensions[row].height = 16
 
-    # Right table: licence entries
-    for idx, lic in enumerate(licences):
-        r   = 10 + idx
-        alt = ALT1_FILL if idx % 2 == 0 else ALT2_FILL
-        lic_no_val = int(lic['lic_no']) if lic['lic_no'].isdigit() else lic['lic_no']
-        for col, val in [(8, lic['itmsno']), (9, lic_no_val), (10, lic['debit_duty'])]:
-            c = dd.cell(row=r, column=col); c.value = val
+    # right-hand licence-number reference table (optional, informational)
+    right_row = 10
+    for key, lic_no in sorted(lic_no_per_item.items()):
+        alt = ALT1_FILL if right_row % 2 == 0 else ALT2_FILL
+        lic_no_val = int(lic_no) if lic_no.isdigit() else lic_no
+        for col, val in [(8, key[1]), (9, lic_no_val), (10, bcd_forgone.get(key, ''))]:
+            c = dd.cell(row=right_row, column=col); c.value = val
             _style(c, font=LIC_FONT, fill=alt,
                    align=RIGHT if col == 10 else CENTER,
                    num_fmt=NUM_FMT if col == 10 else 'General',
                    border=_all_border())
+        right_row += 1
 
-    # Licence total
-    if licences:
-        last_lic = 10 + len(licences) - 1
-        lic_tot  = last_lic + 1
-        c = dd.cell(row=lic_tot, column=8); c.value = 'TOTAL'
-        _style(c, font=SUM_FONT, fill=SUM_FILL, align=CENTER, border=_all_border())
-        c = dd.cell(row=lic_tot, column=9)
-        _style(c, fill=SUM_FILL, border=_all_border())
-        c = dd.cell(row=lic_tot, column=10)
-        c.value = f'=SUM(J10:J{last_lic})'
-        _style(c, font=SUM_FONT, fill=SUM_FILL, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
-
-    # Interest row
     interest_row = item_data_end + 2
     c = dd.cell(row=interest_row, column=3); c.value = 'INTEREST'
     _style(c, font=LBL_FONT, fill=LBL_FILL, align=LEFT, border=_all_border())
@@ -2059,8 +2080,7 @@ def _fill_d_details(wb, items, duties, licences):
     for col in [2, 4, 5]:
         _style(dd.cell(row=interest_row, column=col), fill=LBL_FILL, border=_all_border())
 
-    # Grand SUM row
-    sum_row  = interest_row + 1
+    sum_row = interest_row + 1
     sum_data = {
         3: f'=SUM(C{item_data_start}:C{interest_row})',
         4: f'=SUM(D{item_data_start}:D{interest_row})',
@@ -2075,7 +2095,6 @@ def _fill_d_details(wb, items, duties, licences):
                border=_all_border())
     dd.row_dimensions[sum_row].height = 18
 
-    # Label rows
     label_row = sum_row + 2
     labels = [('SWS', f'=D{sum_row}'), ('IGST', f'=E{sum_row}'), ('CUSTOM DUTY', f'=C{sum_row}')]
     for i, (lbl, formula) in enumerate(labels):
@@ -2087,12 +2106,11 @@ def _fill_d_details(wb, items, duties, licences):
         for col in [2, 5, 6]:
             _style(dd.cell(row=r, column=col), fill=LBL_FILL, border=_all_border())
 
-    # Breakdown rows
     breakdown_row = label_row + 4
     breakdown_data = [
         (1, 'COSTING BASED ON CUSTOM DUTY + SWS', f'=C{sum_row}+D{sum_row}'),
-        (2, 'PAYMENT BASED ON SWS + IGST',        f'=F{sum_row}'),
-        (3, 'LICSNSE BASED ON CUSTOM DUTY',        f'=C{sum_row}'),
+        (2, 'PAYMENT BASED ON SWS + IGST', f'=F{sum_row}'),
+        (3, 'LICSNSE BASED ON CUSTOM DUTY', f'=C{sum_row}'),
     ]
     for i, (num, label, formula) in enumerate(breakdown_data):
         r = breakdown_row + i
@@ -2138,10 +2156,12 @@ st.markdown('<div class="main-title">📦 BOE → Excel Auto-Filler</div>', unsa
 st.markdown('<div class="sub-title">Ferrari Video | Focal Shipments — Upload BOE PDF → Download Filled Excel</div>', unsafe_allow_html=True)
 
 st.markdown("""<div class="info-box">
-<b>How it works:</b> Upload any Focal BOE PDF → extracts all item details, duties,
-and F. LICENCE DETAILS → fills Excel template → download ready.<br><br>
-<b>BCD Rule:</b> When BCD = 0 for an item, the app sums all DEBIT DUTY (col 11) values
-from the licence table for that item number and writes the total as BCD.
+<b>How it works:</b> Upload any Focal BOE PDF → extracts all item details (across all
+invoices on the BOE), duties, and Part IV Scheme/Licence details → fills Excel
+template → download ready.<br><br>
+<b>BCD Rule:</b> BCD comes from Part IV Section G (Scheme Notification & Duty
+Foregone Details) when the item's duty was paid via licence, which is already
+correctly summed even when an item draws from multiple licences.
 </div>""", unsafe_allow_html=True)
 
 st.divider()
@@ -2156,74 +2176,53 @@ if pdf_file:
         try:
             pages_text = []
             all_duties = {}
-            all_pages  = []
+            all_bcd_forgone = {}
 
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 total_pages = len(pdf.pages)
-                all_pages   = pdf.pages
 
-                for pg_idx in range(2, total_pages):
-                    d = extract_duties_from_page(pdf.pages[pg_idx])
+                for pg in pdf.pages:
+                    d = extract_duties_from_page(pg)
                     if d:
                         all_duties.update(d)
+
+                for pg in pdf.pages:
+                    pg_text = pg.extract_text() or ''
+                    if 'ROSCTL' in pg_text or 'GNX' in pg_text:
+                        all_bcd_forgone.update(parse_scheme_g(pg))
 
                 for p in pdf.pages:
                     pages_text.append(p.extract_text() or "")
 
-            # ── Parse header from page 1 ──────────────────────────────────────
-            header  = parse_header(pages_text[0])
-
-            # ── FIX: use correct key 'exchange_rate' (not 'exchange') ─────────
+            header = parse_header(pages_text[0])
             ex_rate = header.get('exchange_rate', 1.0)
-
-            # ── FIX: Parse HAWB NO from Part I D. Manifest Details col 8 ─────
             header['hawb_no'] = parse_hawb(pages_text[0])
 
-            # ── Build invoice text (pages between page 1 and PART III) ────────
-            invoice_text = ''
-            for _pg_txt in pages_text[1:]:
-                if 'PART - III' in _pg_txt:
-                    break
-                invoice_text += _pg_txt + '\n'
+            # multi-invoice-aware item + meta parsing (Bug 1 & 2 fixes)
+            meta, items = parse_all_items(pages_text[1:], ex_rate)
 
-            meta, items = parse_page2(invoice_text, ex_rate)
+            # cross-check header invoice no/value against Part I summary table
+            inv_summary_list = parse_invoice_summary_multi(pages_text[0])
+            if inv_summary_list and not meta.get('inv_no'):
+                meta['inv_no'] = inv_summary_list[0]['inv_no']
+                meta['inv_value'] = inv_summary_list[0]['inv_value']
 
-            # ── INV NO + INV VALUE from Part I — I. INVOICE DETAILS SUMMARY ──
-            inv_summary = parse_invoice_summary(pages_text[0])
-            if inv_summary.get('inv_no'):
-                meta['inv_no'] = inv_summary['inv_no']
-            if inv_summary.get('inv_value'):
-                meta['inv_value'] = inv_summary['inv_value']  # Correct source: Part I col 3
-            elif not meta.get('inv_no'):
-                inv_no_p1 = parse_invoice_no(pages_text[0])
-                if inv_no_p1:
-                    meta['inv_no'] = inv_no_p1
-
-# ── Supplier name from Part II — B. TRANSACTING PARTIES ──────────
-            meta['supplier'] = parse_supplier(invoice_text)
-
-            
-
-            # Parse licences
             licences = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for pg_idx in range(5, len(pdf.pages)):
-                    pg   = pdf.pages[pg_idx]
+                for pg in pdf.pages:
                     lics = parse_licences_from_page(pg)
                     if lics:
                         licences.extend(lics)
 
-            # Deduplicate licences
             seen = set()
             unique_lics = []
             for lic in licences:
-                key = (lic['itmsno'], lic['lic_no'], lic['debit_duty'])
+                key = (lic['invsno'], lic['itmsno'], lic['lic_no'], lic['debit_duty'])
                 if key not in seen:
                     seen.add(key)
                     unique_lics.append(lic)
             licences = unique_lics
 
-            # Extract Assess Values from Part III
             assess_values = {}
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 part3_pages = []
@@ -2238,9 +2237,8 @@ if pdf_file:
                         break
                 assess_values = extract_assess_values_from_pages(part3_pages)
 
-            # ── FIX: BE No comes from parse_header, pass to duties dict ──────
             be_no_all = parse_be_no_from_pages(pages_text)
-            all_duties['_be_no']   = be_no_all or header.get('be_no', '')
+            all_duties['_be_no'] = be_no_all or header.get('be_no', '')
             all_duties['_be_date'] = header.get('be_date', '')
 
         except Exception as e:
@@ -2251,25 +2249,24 @@ if pdf_file:
     st.success(f"✅ Parsed — {total_pages} pages · {len(items)} items · {len(licences)} licence rows")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Exchange Rate",  f"₹ {header.get('exchange_rate', '—')}")
-    c2.metric("Invoice No",     meta.get('inv_no', '—'))
-    c3.metric("Invoice Date",   meta.get('inv_date', '—'))
-    c4.metric("Freight (₹)",   f"{meta.get('freight', '—'):,}" if meta.get('freight') else '—')
+    c1.metric("Exchange Rate", f"₹ {header.get('exchange_rate', '—')}")
+    c2.metric("Invoice No", meta.get('inv_no', '—'))
+    c3.metric("Invoice Date", meta.get('inv_date', '—'))
+    c4.metric("Freight (₹)", f"{meta.get('freight', '—'):,}" if meta.get('freight') else '—')
     c5.metric("Insurance (₹)", f"{meta.get('insurance', '—'):,}" if meta.get('insurance') else '—')
 
-    # Extra info row
     c6, c7, c8, c9, c10 = st.columns(5)
-    c6.metric("Supplier",       meta.get('supplier', '—')[:25] if meta.get('supplier') else '—')
-    c7.metric("AWB / HAWB No",  header.get('hawb_no', '—'))
-    c8.metric("BE No",          header.get('be_no', '—'))
-    c9.metric("Inv Value (USD)",f"{meta.get('inv_value', '—'):,}" if meta.get('inv_value') else '—')
-    c10.metric("BE Date",       header.get('be_date', '—'))
+    c6.metric("Supplier", meta.get('supplier', '—')[:25] if meta.get('supplier') else '—')
+    c7.metric("AWB / HAWB No", header.get('hawb_no', '—'))
+    c8.metric("BE No", header.get('be_no', '—'))
+    c9.metric("Inv Value (USD)", f"{meta.get('inv_value', '—'):,}" if meta.get('inv_value') else '—')
+    c10.metric("BE Date", header.get('be_date', '—'))
 
     import pandas as pd
 
     tab1, tab2, tab3, tab4 = st.tabs([
         f"📦 Items ({len(items)})",
-        f"🏦 Duties ({len(all_duties)-2})",
+        f"🏦 Duties ({len(all_duties) - 2})",
         f"📜 Licences ({len(licences)})",
         "🔍 BCD Source",
     ])
@@ -2277,15 +2274,16 @@ if pdf_file:
     with tab1:
         if items:
             df = pd.DataFrame(items)
-            df.columns = ['S.No', 'Description', 'Unit Price (USD)', 'Qty']
+            df = df[['global_sno', 'invsno', 'itemsn', 'desc', 'price', 'qty']]
+            df.columns = ['Row #', 'Invoice', 'Item # (in invoice)', 'Description', 'Unit Price (USD)', 'Qty']
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.warning("⚠️ No items extracted")
 
     with tab2:
         duty_rows = [
-            {'Item': k, 'BCD': v.get('bcd'), 'SWS': v.get('sws'), 'IGST': v.get('igst')}
-            for k, v in sorted((i for i in all_duties.items() if isinstance(i[0], int)), key=lambda x: x[0])
+            {'Invoice': k[0], 'Item': k[1], 'BCD Paid': v.get('bcd'), 'SWS': v.get('sws'), 'IGST': v.get('igst')}
+            for k, v in sorted((i for i in all_duties.items() if isinstance(i[0], tuple)), key=lambda x: (x[0][0], x[0][1]))
         ]
         if duty_rows:
             st.dataframe(pd.DataFrame(duty_rows), use_container_width=True, hide_index=True)
@@ -2294,45 +2292,36 @@ if pdf_file:
 
     with tab3:
         if licences:
-            st.caption("These are all rows from F. LICENCE DETAILS table. DEBIT DUTY is col 11.")
+            st.caption("Reference licence numbers from F. LICENCE DETAILS.")
             df_lic = pd.DataFrame(licences)
             st.dataframe(df_lic, use_container_width=True, hide_index=True)
         else:
             st.info("ℹ️ No licence entries found")
 
     with tab4:
-        lic_duty_per_item = defaultdict(float)
-        for lic in licences:
-            lic_duty_per_item[lic['itmsno']] += lic['debit_duty']
-
         bcd_rows = []
         for it in items:
-            sno     = it['sno']
-            d       = all_duties.get(sno, {})
-            bcd_val = d.get('bcd', 0)
+            key = (it['invsno'], it['itemsn'])
+            d = all_duties.get(key, {})
+            bcd_paid = d.get('bcd', 0)
+            bcd_fg = all_bcd_forgone.get(key)
 
-            if bcd_val == 0 and sno in lic_duty_per_item:
-                item_lics  = [l for l in licences if l['itmsno'] == sno]
-                breakdown  = ' + '.join(
-                    f"{l['lic_no']} → {l['debit_duty']}" for l in item_lics
-                )
-                bcd_written = round(lic_duty_per_item[sno], 2)
-                source      = '📜 LICENCE (col 11 sum)'
-            elif bcd_val > 0:
-                breakdown   = '—'
-                bcd_written = bcd_val
-                source      = '💵 CASH / CYBER'
+            if bcd_paid == 0 and bcd_fg:
+                bcd_written = round(bcd_fg, 2)
+                source = '📜 SCHEME G (duty forgone)'
+            elif bcd_paid > 0:
+                bcd_written = bcd_paid
+                source = '💵 CASH / CYBER'
             else:
-                breakdown   = 'No BCD, no licence'
                 bcd_written = 0
-                source      = '⚪ NIL'
+                source = '⚪ NIL'
 
             bcd_rows.append({
-                'Item':        sno,
+                'Row #': it['global_sno'],
+                'Invoice-Item': f"{it['invsno']}-{it['itemsn']}",
                 'Description': it['desc'][:45],
-                'Source':      source,
+                'Source': source,
                 'BCD Written': bcd_written,
-                'Licence Breakdown': breakdown,
             })
 
         st.caption("Preview of what will be written into BCD column in Excel")
@@ -2342,7 +2331,7 @@ if pdf_file:
 
     with st.spinner("✍️ Filling Excel..."):
         try:
-            filled_bytes = fill_excel(header, meta, items, all_duties, licences, assess_values)
+            filled_bytes = fill_excel(header, meta, items, all_duties, all_bcd_forgone, licences, assess_values)
             filename = f"BOE_{meta.get('inv_no', 'filled')}.xlsx"
             if filled_bytes is None:
                 st.error("❌ fill_excel returned None — check _fill_c_sheet for errors")
@@ -2363,10 +2352,15 @@ if pdf_file:
 
     st.markdown("""<div class="info-box">
     <b>What was filled:</b><br>
-    ✅ <b>C-SHEET</b>: Supplier · Exchange Rate · Invoice No · Invoice Value (USD) · 
+    ✅ <b>C-SHEET</b>: Supplier · Exchange Rate · Invoice No · Invoice Value (USD) ·
     Invoice Date · AWB/HAWB No · Freight · Insurance · All item/duty/cost formulas<br>
-    ✅ <b>D-DETAILS</b>: BOE No · BCD = sum of DEBIT DUTY (col 11) per item when BCD=0 ·
-    SWS · IGST · Paid/Cyber Receipt · Licence right table · All totals
+    ✅ <b>D-DETAILS</b>: BOE No · BCD from Part IV Scheme/Duty-Forgone details ·
+    SWS · IGST · Paid/Cyber Receipt · Licence reference table · All totals<br><br>
+    <b>Note:</b> This BOE may contain multiple invoices. All items across every
+    invoice are numbered sequentially in the Excel (Row # column); the header
+    fields (supplier / invoice no / freight / insurance) reflect the invoice
+    with the most line items. If you need separate costing per invoice,
+    let me know and I can split this into one sheet per invoice instead.
     </div>""", unsafe_allow_html=True)
 
 else:
