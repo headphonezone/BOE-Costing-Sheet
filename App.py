@@ -1274,18 +1274,35 @@ def parse_header(page1_text: str) -> dict:
 
 
 def parse_hawb(page1_text: str) -> str:
+    """
+    FIX: HAWB numbers can be alphanumeric (e.g. "HKAE26075428") rather than
+    purely numeric. When the number is long, the PDF's manifest-details cell
+    wraps it onto two lines, and the trailing digits print AFTER the HAWB
+    date on the following line — e.g. the raw text reads:
+        "...61855315816 03/07/2026 HKAE260754 03/07/2026\\n28"
+    where "HKAE260754" + "28" together form the real HAWB "HKAE26075428".
+    This is checked first; the older purely-numeric patterns remain as
+    fallbacks for BOEs where the HAWB fits on one line.
+    """
+    m = re.search(
+        r'\d{2}/\d{2}/\d{4}\s+([A-Z]{2,}\d+)\s+\d{2}/\d{2}/\d{4}\s*\n(\d{1,6})\b',
+        page1_text
+    )
+    if m:
+        return m.group(1) + m.group(2)
+
     m = re.search(r'\d{2}/\d{2}/\d{4}\s+(\d{9,})\s+\d{2}/\d{2}/\d{4}', page1_text)
     if m:
         return m.group(1)
 
-    m = re.search(r'HAWB\s*NO\s*[:\-]?\s*\n?\s*(\d{8,})', page1_text, re.IGNORECASE)
+    m = re.search(r'HAWB\s*NO\s*[:\-]?\s*\n?\s*([A-Z0-9]{8,})', page1_text, re.IGNORECASE)
     if m:
         return m.group(1)
 
     manifest_idx = page1_text.upper().find('MANIFEST')
     if manifest_idx != -1:
         block = page1_text[manifest_idx: manifest_idx + 800]
-        m = re.search(r'(\d{11,12})', block)
+        m = re.search(r'([A-Z]{0,4}\d{9,12})', block)
         if m:
             return m.group(1)
 
@@ -1636,17 +1653,16 @@ def extract_duties_from_page(page) -> dict:
 
 def parse_scheme_g(page) -> dict:
     """
-    FIX (Bug 6): Part IV, Section G "SCHEME NOTIFICATION AND DUTY FOREGONE
-    DETAILS" gives one row per item with a pre-summed "BCD AMT FG" value —
-    already correctly totalled even when an item's BCD was paid via two
-    different licences. This is far more robust than reconstructing the sum
-    from the multi-page F. LICENCE DETAILS table.
-
-    Continuation pages don't repeat the section header, so we scan any page
-    containing the scheme code "ROSCTL" (or "GNX..." for GNX100 items)
-    rather than gating on the header text. Token x-positions are matched by
-    tolerance rather than by list position, since rotated sidebar text
-    sometimes inserts an extra low-x garbage token that shifts word order.
+    FIX (Bug 6, generalized): the previous version only recognized rows
+    whose scheme name was literally "ROSCTL", which broke on BOEs using a
+    different export-incentive scheme (e.g. "RODTEP" in this HK Jade BOE —
+    same column layout, different scheme name). Instead of matching a
+    specific scheme name string, this now recognizes the row by its column
+    *shape*: invsno/itmsno numbers in their fixed positions, some uppercase
+    alphabetic scheme-name token (whatever it is) in the scheme-name
+    column, and a numeric BCD-forgone value in its column. This works for
+    any scheme name and, like before, scans every page rather than gating
+    on the section header text (continuation pages don't repeat it).
 
     Returns a dict keyed by (invsno, itemsn) -> bcd_amt_forgone (float).
     """
@@ -1655,20 +1671,18 @@ def parse_scheme_g(page) -> dict:
 
     for y in sorted(row_words.keys()):
         words = row_words[y]
-        line = ' '.join(t for _, t in words)
-        if 'ROSCTL' not in line and 'GNX' not in line:
-            continue
-
-        invsno = itmsno = bcd_fg = None
+        invsno = itmsno = bcd_fg = scheme_name = None
         for x, t in words:
             if 70 <= x <= 90 and re.match(r'^\d+$', t):
                 invsno = int(t)
             elif 105 <= x <= 130 and re.match(r'^\d+$', t):
                 itmsno = int(t)
+            elif 190 <= x <= 235 and t.isalpha() and t.isupper() and len(t) >= 3:
+                scheme_name = t
             elif 440 <= x <= 505 and re.match(r'^[\d.]+$', t):
                 bcd_fg = float(t)
 
-        if invsno is not None and itmsno is not None and bcd_fg is not None:
+        if invsno is not None and itmsno is not None and bcd_fg is not None and scheme_name:
             result[(invsno, itmsno)] = bcd_fg
 
     return result
@@ -1676,36 +1690,39 @@ def parse_scheme_g(page) -> dict:
 
 def parse_licences_from_page(page) -> list[dict]:
     """
+    FIX (generalized): previously hardcoded the licence scheme code "RS" at
+    the end of the row pattern, which broke on BOEs using a different code
+    (e.g. "RD" in this HK Jade BOE). Now recognized by column shape instead:
+    invsno/itemsn in their fixed positions, a long (8+ digit) licence number
+    in the LIC NO column, and a numeric debit-duty value in the DEBIT DUTY
+    column — regardless of what the scheme code itself says.
+
     Kept only as an optional reference source for licence NUMBERS shown in
     D-DETAILS' right-hand table (not for computing BCD amounts — use
     parse_scheme_g for that, it's the reliable source).
     """
     licences = []
-    page_text = page.extract_text() or ''
-    if 'LICENCE DETAILS' not in page_text and 'ROSCTL' not in page_text:
-        return licences
-
     row_words = get_row_words(page, min_x=0)
+
     for y in sorted(row_words.keys()):
         words = row_words[y]
-        texts = [t for _, t in words]
-        line = ' '.join(texts)
-        m = re.search(r'(?:^|\s)(\d)\s+(\d{1,2})\s+1\s+(\d{9,})\s+\d{2}-[A-Z]{3}-\d{2}\s+RS', line)
-        if not m:
-            continue
-        invsno, itmsno, lic_no = int(m.group(1)), int(m.group(2)), m.group(3)
-        debit_duty = None
-        nums = [t for _, t in words if re.match(r'^[\d.]+$', t)]
-        if nums:
-            try:
-                debit_duty = float(nums[-1])
-            except ValueError:
-                pass
-        if debit_duty and debit_duty > 0:
+        invsno = itmsno = lic_no = debit_duty = None
+        for x, t in words:
+            if 70 <= x <= 90 and re.match(r'^\d+$', t):
+                invsno = int(t)
+            elif 105 <= x <= 130 and re.match(r'^\d+$', t):
+                itmsno = int(t)
+            elif 190 <= x <= 260 and re.match(r'^\d{8,}$', t):
+                lic_no = t
+            elif 505 <= x <= 570 and re.match(r'^[\d.]+$', t):
+                debit_duty = float(t)
+
+        if invsno is not None and itmsno is not None and lic_no and debit_duty:
             licences.append({
                 'invsno': invsno, 'itmsno': itmsno,
                 'lic_no': lic_no, 'debit_duty': debit_duty,
             })
+
     return licences
 
 
@@ -2187,9 +2204,7 @@ if pdf_file:
                         all_duties.update(d)
 
                 for pg in pdf.pages:
-                    pg_text = pg.extract_text() or ''
-                    if 'ROSCTL' in pg_text or 'GNX' in pg_text:
-                        all_bcd_forgone.update(parse_scheme_g(pg))
+                    all_bcd_forgone.update(parse_scheme_g(pg))
 
                 for p in pdf.pages:
                     pages_text.append(p.extract_text() or "")
