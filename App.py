@@ -1,13 +1,18 @@
-import re, io, base64
+import base64
+import io
+import re
+from collections import defaultdict
+
 import pdfplumber
 import streamlit as st
 from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from collections import defaultdict
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMBEDDED EXCEL TEMPLATE  (base64-encoded)
+# TEMPLATE
 # ─────────────────────────────────────────────────────────────────────────────
+# Keep your existing TEMPLATE_B64 constant from your original file — it is not
+# reproduced here since it's just base64 data for your Excel template.
 TEMPLATE_B64 = (
     'UEsDBBQABgAIAAAAIQCG2vR3hgEAAJQGAAATAAgCW0NvbnRlbnRfVHlwZXNdLnhtbCCiBAIooAACAAAA'
     'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
@@ -1218,8 +1223,6 @@ TEMPLATE_B64 = (
     'AAAAAAAEEwEAZG9jUHJvcHMvYXBwLnhtbFBLBQYAAAAAEQARAJYEAAArFgEAAAA='
 )
 
-
-
 def get_template_bytes() -> bytes:
     return base64.b64decode(TEMPLATE_B64)
 
@@ -1690,34 +1693,69 @@ def parse_scheme_g(page) -> dict:
 
 def parse_licences_from_page(page) -> list[dict]:
     """
-    FIX (generalized): previously hardcoded the licence scheme code "RS" at
-    the end of the row pattern, which broke on BOEs using a different code
-    (e.g. "RD" in this HK Jade BOE). Now recognized by column shape instead:
-    invsno/itemsn in their fixed positions, a long (8+ digit) licence number
-    in the LIC NO column, and a numeric debit-duty value in the DEBIT DUTY
-    column — regardless of what the scheme code itself says.
+    FIX (items with corrupted licence numbers, e.g. #6/#9/#11/#14/#16 on some
+    BOEs): rotated sidebar/watermark text sometimes bleeds a stray letter
+    into the middle of the LIC NO token on its own row (e.g. "2607E000174"),
+    or knocks the whole token onto the row immediately above with an extra
+    character prepended (e.g. "1E2511012687" merging the LIC SLNO digit
+    into the number). Both cases previously caused that row to be dropped
+    entirely.
 
-    Kept only as an optional reference source for licence NUMBERS shown in
-    D-DETAILS' right-hand table (not for computing BCD amounts — use
-    parse_scheme_g for that, it's the reliable source).
+    Fix: invsno/itemsn/debit-duty must still be found together on the same
+    row (that trio is never corrupted in samples seen so far) — that's the
+    anchor for a real data row. The licence number is then read from that
+    row's LIC NO column first; if it's not clean there (missing, merged
+    with junk, wrong length), the row immediately above is checked too,
+    over a slightly wider x-range, since that's where the corruption
+    displaces it. Any stray non-digit characters are stripped, and if more
+    than 10 digits remain (licence numbers here are 10 digits), the extra
+    leading digit(s) — from the corruption prepending characters — are
+    trimmed off the front.
+
+    Returns ALL matching rows (not deduplicated per item) — some items
+    legitimately draw from two different licences, and every row should
+    show up individually in D-DETAILS' reference table.
     """
+    def _extract_lic_no(tokens):
+        for x, t in tokens:
+            digits = re.sub(r'\D', '', t)
+            if len(digits) == 10:
+                return digits
+            if len(digits) > 10:
+                return digits[-10:]
+        return None
+
+    page_text = page.extract_text() or ''
+    if 'LICENCE DETAILS' not in page_text:
+        return []
+
     licences = []
     row_words = get_row_words(page, min_x=0)
+    sorted_ys = sorted(row_words.keys())
 
-    for y in sorted(row_words.keys()):
+    for i, y in enumerate(sorted_ys):
         words = row_words[y]
-        invsno = itmsno = lic_no = debit_duty = None
+        invsno = itmsno = debit_duty = None
         for x, t in words:
             if 70 <= x <= 90 and re.match(r'^\d+$', t):
                 invsno = int(t)
-            elif 105 <= x <= 130 and re.match(r'^\d+$', t):
+            elif 105 <= x <= 135 and re.match(r'^\d+$', t):
                 itmsno = int(t)
-            elif 190 <= x <= 260 and re.match(r'^\d{8,}$', t):
-                lic_no = t
-            elif 505 <= x <= 570 and re.match(r'^[\d.]+$', t):
+            elif 505 <= x <= 575 and re.match(r'^[\d.]+$', t):
                 debit_duty = float(t)
 
-        if invsno is not None and itmsno is not None and lic_no and debit_duty:
+        if invsno is None or itmsno is None or debit_duty is None:
+            continue
+
+        candidates = [(x, t) for x, t in words if 185 <= x <= 265]
+        lic_no = _extract_lic_no(candidates)
+        if lic_no is None and i > 0:
+            y_prev = sorted_ys[i - 1]
+            if y - y_prev <= 12:
+                prev_candidates = [(x, t) for x, t in row_words[y_prev] if 150 <= x <= 265]
+                lic_no = _extract_lic_no(prev_candidates)
+
+        if lic_no:
             licences.append({
                 'invsno': invsno, 'itmsno': itmsno,
                 'lic_no': lic_no, 'debit_duty': debit_duty,
@@ -2004,15 +2042,16 @@ def _fill_d_details(wb, items, duties, bcd_forgone, licences):
         if num_fmt: cell.number_format = num_fmt
         if border: cell.border = border
 
-    # licence numbers keyed by (invsno, itmsno), for reference display only
-    lic_no_per_item = {}
-    for lic in licences:
-        key = (lic['invsno'], lic['itmsno'])
-        lic_no_per_item.setdefault(key, lic['lic_no'])
+    # FIX (issue #2): previously kept only the first licence per (invsno,
+    # itmsno) via setdefault, which silently dropped any second licence an
+    # item drew from. Now every row from parse_licences_from_page is shown
+    # individually, sorted for readability — nothing is grouped/collapsed.
+    licences_sorted = sorted(licences, key=lambda l: (l['invsno'], l['itmsno']))
 
     be_no = duties.get('_be_no', '')
+    be_date = duties.get('_be_date', '')
     h8 = dd['H8']
-    h8.value = f'BOE NO: {be_no}'
+    h8.value = f'BOE NO: {be_no}   BE DATE: {be_date}'
     _style(h8, font=Font(name='Calibri', bold=True, size=11, color='1F3864'), align=LEFT)
 
     clear_to = 10 + max(n, 10) + 40
@@ -2067,21 +2106,21 @@ def _fill_d_details(wb, items, duties, bcd_forgone, licences):
         c = dd.cell(row=row, column=5); c.value = d.get('igst', 0)
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
+        # FIX (issue #4): Paid/Cyber Receipt is now always SWS + IGST,
+        # regardless of whether BCD was paid in cash or via licence —
+        # previously this also added the BCD column in the cash-paid case.
         c = dd.cell(row=row, column=6)
-        if bcd_paid == 0 and bcd_fg:
-            c.value = f'=D{row}+E{row}'
-        else:
-            c.value = f'=C{row}+D{row}+E{row}'
+        c.value = f'=D{row}+E{row}'
         _style(c, font=DATA_FONT, fill=alt, align=RIGHT, num_fmt=NUM_FMT, border=_all_border())
 
         dd.row_dimensions[row].height = 16
 
-    # right-hand licence-number reference table (optional, informational)
+    # right-hand licence-number reference table: every row shown individually
     right_row = 10
-    for key, lic_no in sorted(lic_no_per_item.items()):
+    for lic in licences_sorted:
         alt = ALT1_FILL if right_row % 2 == 0 else ALT2_FILL
-        lic_no_val = int(lic_no) if lic_no.isdigit() else lic_no
-        for col, val in [(8, key[1]), (9, lic_no_val), (10, bcd_forgone.get(key, ''))]:
+        lic_no_val = int(lic['lic_no']) if lic['lic_no'].isdigit() else lic['lic_no']
+        for col, val in [(8, lic['itmsno']), (9, lic_no_val), (10, lic['debit_duty'])]:
             c = dd.cell(row=right_row, column=col); c.value = val
             _style(c, font=LIC_FONT, fill=alt,
                    align=RIGHT if col == 10 else CENTER,
