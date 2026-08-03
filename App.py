@@ -1464,28 +1464,20 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
         meta['freight'] = float(m.group(2))
         meta['insurance'] = float(m.group(3))
 
-    # FIX: the old misc-charge search used a generic 300-char window after
-    # the word "MISC" and grabbed the first decimal number > 0.5 it found —
-    # which on invoices with no actual misc charge ended up grabbing an
-    # unrelated number further down the page (e.g. the ASS. VALUE total)
-    # and multiplying it by the exchange rate, producing a wildly wrong
-    # figure. Now the window is bounded strictly between the "13.MISC
-    # CHARGE" and "14.ASS. VALUE" labels, so an empty/blank misc charge
-    # correctly resolves to 0 instead of fabricating a huge number.
+    # FIX: pdfplumber's reading order puts the "13.MISC CHARGE 14.ASS. VALUE"
+    # labels (header row) far from their actual values — the values are
+    # rendered as their own line ("<misc> <ass value>") right before the
+    # invoice's currency/term ("USD" / "FOB" / ")") lower down the page, not
+    # adjacent to the labels. Searching a window after the label text either
+    # found nothing or (worse) matched the "13" inside the label itself.
+    # Anchor on that "<misc> <ass value>\nUSD\n<TERM>\n)" line instead: if two
+    # numbers precede the currency/term/close-paren anchor, the first is the
+    # misc charge (in the invoice currency); if only one number precedes it,
+    # there's no misc charge and it stays 0.
     meta['misc_charges_inr'] = 0.0
-    misc_idx = page2_text.find('13.MISC CHARGE')
-    if misc_idx != -1:
-        ass_idx = page2_text.find('14.ASS. VALUE', misc_idx)
-        window = page2_text[misc_idx: ass_idx] if ass_idx != -1 else page2_text[misc_idx: misc_idx + 60]
-        nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', window)
-        for n in nums:
-            try:
-                val = float(n)
-                if val > 0.5:
-                    meta['misc_charges_inr'] = round(val * exchange_rate, 2)
-                    break
-            except Exception:
-                pass
+    m = re.search(r'(\d+(?:\.\d+)?)\s+(\d+\.\d+)\s*\n\s*[A-Z]{3}\s*\n\s*[A-Z&]+\s*\n\s*\)', page2_text)
+    if m:
+        meta['misc_charges_inr'] = round(float(m.group(1)) * exchange_rate, 2)
 
     items = []
     item_pat = re.compile(
