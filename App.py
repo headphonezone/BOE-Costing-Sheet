@@ -1464,20 +1464,20 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
         meta['freight'] = float(m.group(2))
         meta['insurance'] = float(m.group(3))
 
-    # FIX: pdfplumber's reading order puts the "13.MISC CHARGE 14.ASS. VALUE"
-    # labels (header row) far from their actual values — the values are
-    # rendered as their own line ("<misc> <ass value>") right before the
-    # invoice's currency/term ("USD" / "FOB" / ")") lower down the page, not
-    # adjacent to the labels. Searching a window after the label text either
-    # found nothing or (worse) matched the "13" inside the label itself.
-    # Anchor on that "<misc> <ass value>\nUSD\n<TERM>\n)" line instead: if two
-    # numbers precede the currency/term/close-paren anchor, the first is the
-    # misc charge (in the invoice currency); if only one number precedes it,
-    # there's no misc charge and it stays 0.
+    # FIX: verified against real pdfplumber output — the "13.MISC CHARGE
+    # 14.ASS. VALUE" label line is immediately followed by its own value
+    # line, e.g. "E 1690 1595837.33" (the leading "E" is bleed-through from
+    # a sideways section-label glyph; not always present). When there is no
+    # misc charge, that value line holds just the assess value on its own,
+    # e.g. "E 84966.62". So: take the line right after the label, strip any
+    # leading letter, and split on whitespace — two numbers means
+    # [misc, assess value]; one number means no misc charge (stays 0).
     meta['misc_charges_inr'] = 0.0
-    m = re.search(r'(\d+(?:\.\d+)?)\s+(\d+\.\d+)\s*\n\s*[A-Z]{3}\s*\n\s*[A-Z&]+\s*\n\s*\)', page2_text)
+    m = re.search(r'14\.ASS\. VALUE\s*\n\s*[A-Z]?\s*([\d.\s]+?)\s*\n', page2_text)
     if m:
-        meta['misc_charges_inr'] = round(float(m.group(1)) * exchange_rate, 2)
+        nums = m.group(1).split()
+        if len(nums) >= 2:
+            meta['misc_charges_inr'] = round(float(nums[0]) * exchange_rate, 2)
 
     items = []
     item_pat = re.compile(
