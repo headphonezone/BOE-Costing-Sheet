@@ -1477,7 +1477,7 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
     if misc_idx != -1:
         ass_idx = page2_text.find('14.ASS. VALUE', misc_idx)
         window = page2_text[misc_idx: ass_idx] if ass_idx != -1 else page2_text[misc_idx: misc_idx + 60]
-        nums = re.findall(r'\b(\d+\.\d+)\b', window)
+        nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', window)
         for n in nums:
             try:
                 val = float(n)
