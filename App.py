@@ -7,6 +7,8 @@ import pdfplumber
 import streamlit as st
 from openpyxl import load_workbook
 
+import db
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPLATE
@@ -1773,16 +1775,17 @@ def format_date(raw: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fill_excel(header: dict, meta: dict, items: list, duties: dict,
-                bcd_forgone: dict, licences: list, assess_values: dict = None) -> bytes:
+                bcd_forgone: dict, licences: list, assess_values: dict = None,
+                variable_fields: dict = None) -> bytes:
     wb = load_workbook(io.BytesIO(get_template_bytes()))
-    _fill_c_sheet(wb, header, meta, items, duties, assess_values or {})
+    _fill_c_sheet(wb, header, meta, items, duties, assess_values or {}, variable_fields or {})
     _fill_d_details(wb, items, duties, bcd_forgone, licences)
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
 
 
-def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
+def _fill_c_sheet(wb, header, meta, items, duties, assess_values, variable_fields):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     cs = wb['C-SHEET']
@@ -1802,6 +1805,15 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     HDR_FILL = PatternFill('solid', fgColor='2E75B6')
     EXTRA_FILL = PatternFill('solid', fgColor='E2EFDA')
     ASSESS_FILL = PatternFill('solid', fgColor='FFF2CC')
+    YELLOW_FILL = PatternFill('solid', fgColor='FFFF00')
+
+    def _status_fill(field_key: str):
+        """GREEN if this variable field has been marked 'fixed', else YELLOW (provisional)."""
+        status = variable_fields.get(field_key, {}).get('status', 'provisional')
+        return GREEN_FILL if status == 'fixed' else YELLOW_FILL
+
+    def _var_value(field_key: str, default: float = 0.0):
+        return variable_fields.get(field_key, {}).get('value', default)
 
     WHT_BOLD = Font(name='Calibri', bold=True, color='FFFFFF', size=10)
     BLK_BOLD = Font(name='Calibri', bold=True, color='000000', size=10)
@@ -1843,8 +1855,8 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     cs['B5'].value = meta.get('supplier', '')
     _st(cs['B5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    cs['D5'].value = header.get('exchange_rate', 0)
-    _st(cs['D5'], font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+    cs['D5'].value = _var_value('exchange_rate', header.get('exchange_rate', 0))
+    _st(cs['D5'], font=BLK_BOLD, fill=_status_fill('exchange_rate'), align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
     cs['F5'].value = meta.get('inv_no', '')
     _st(cs['F5'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
@@ -1859,17 +1871,38 @@ def _fill_c_sheet(wb, header, meta, items, duties, assess_values):
     cs['F9'].value = header.get('hawb_no', '')
     _st(cs['F9'], font=BLK_BOLD, fill=GREEN_FILL, align=LEFT, border=_ab())
 
-    cs['I5'].value = meta.get('freight', 0)
+    cs['I5'].value = _var_value('freight_charges', meta.get('freight', 0))
+    _st(cs['I5'], font=BLK_BOLD, fill=_status_fill('freight_charges'), align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+
     cs['I6'].value = meta.get('insurance', 0)
 
+    cs['I7'].value = _var_value('clearing_charges', 0)
+    _st(cs['I7'], font=BLK_BOLD, fill=_status_fill('clearing_charges'), align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+
     j5 = cs['J5']
-    j5.value = 'Freight charges - 2'
+    j5.value = 'FREIGHT CHARGES - 2'
     _st(j5, font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
 
     k5 = cs['K5']
     misc_inr_val = meta.get('misc_charges_inr', 0.0)
     k5.value = misc_inr_val
     _st(k5, font=BLK_BOLD, fill=GREEN_FILL, align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
+
+    # New rows under FREIGHT CHARGES - 2: SUPPLIER FREIGHT / BANK CHARGES /
+    # OWN BANK CHARGES, each editable in the interface with a provisional
+    # (yellow) / fixed (green) status.
+    for row, label, field_key in [
+        (6, 'SUPPLIER FREIGHT', 'supplier_freight'),
+        (7, 'BANK CHARGES', 'bank_charges'),
+        (8, 'OWN BANK CHARGES', 'own_bank_charges'),
+    ]:
+        jcell = cs.cell(row=row, column=10)  # column J
+        jcell.value = label
+        _st(jcell, font=WHT_BOLD, fill=NAVY_FILL, align=CENTER, border=_ab())
+
+        kcell = cs.cell(row=row, column=11)  # column K
+        kcell.value = _var_value(field_key, 0)
+        _st(kcell, font=BLK_BOLD, fill=_status_fill(field_key), align=RIGHT, border=_ab(), num_fmt=NUM_FMT)
 
     for r in range(5, 11):
         cs.row_dimensions[r].height = 18
@@ -2308,6 +2341,78 @@ if pdf_file:
     c9.metric("Inv Value (USD)", f"{meta.get('inv_value', '—'):,}" if meta.get('inv_value') else '—')
     c10.metric("BE Date", header.get('be_date', '—'))
 
+    # ── Variable / Provisional Cost Items ───────────────────────────────────
+    # These six fields are editable in the interface, persisted per BE No in
+    # Supabase, and re-loaded automatically the next time this same BOE is
+    # opened. Each carries a Provisional (yellow) / Fixed (green) status that
+    # is mirrored as the cell fill color in the generated Excel.
+    be_no_key = all_duties.get('_be_no', '') or header.get('be_no', '')
+
+    st.divider()
+    st.subheader("🛠️ Variable / Provisional Cost Items")
+    st.caption(
+        "Editable per BOE (keyed by BE No) and saved to Supabase. "
+        "Yellow = Provisional, Green = Fixed — same colors are applied in the Excel."
+    )
+
+    if not be_no_key:
+        st.warning("⚠️ No BE No found on this PDF — variable items can't be saved/reloaded without it.")
+
+    try:
+        saved_record = db.get_boe_record(be_no_key) if be_no_key else None
+    except Exception as e:
+        saved_record = None
+        st.error(f"Could not reach Supabase: {e}")
+    saved_record = saved_record or {}
+
+    field_defs = [
+        ("exchange_rate", "Exchange Rate", header.get('exchange_rate', 0.0)),
+        ("freight_charges", "Freight Charges", meta.get('freight', 0.0)),
+        ("clearing_charges", "Clearing Charges", 0.0),
+        ("supplier_freight", "Supplier Freight", 0.0),
+        ("bank_charges", "Bank Charges", 0.0),
+        ("own_bank_charges", "Own Bank Charges", 0.0),
+    ]
+
+    variable_fields = {}
+    field_cols = st.columns(3)
+    for i, (fkey, flabel, fdefault) in enumerate(field_defs):
+        saved_val = saved_record.get(fkey)
+        saved_status = saved_record.get(f"{fkey}_status") or "provisional"
+        starting_value = float(saved_val) if saved_val is not None else float(fdefault or 0.0)
+
+        status_widget_key = f"status_{fkey}_{be_no_key}"
+        value_widget_key = f"val_{fkey}_{be_no_key}"
+        # reflects the *current* radio selection (post-rerun), not just the
+        # saved one, so the badge updates the moment you flip the toggle
+        live_status = st.session_state.get(status_widget_key, saved_status)
+        badge_color = "#92D050" if live_status == "fixed" else "#FFFF00"
+
+        with field_cols[i % 3]:
+            st.markdown(
+                f"<div style='background-color:{badge_color}; padding:3px 10px; "
+                f"border-radius:4px; font-weight:700; display:inline-block; "
+                f"margin-bottom:2px; color:#000;'>{flabel.upper()}</div>",
+                unsafe_allow_html=True,
+            )
+            value = st.number_input(
+                flabel, value=starting_value, key=value_widget_key,
+                label_visibility="collapsed",
+            )
+            status = st.radio(
+                f"{flabel} status", ["provisional", "fixed"],
+                index=0 if saved_status == "provisional" else 1,
+                key=status_widget_key, horizontal=True,
+                label_visibility="collapsed",
+            )
+            variable_fields[fkey] = {"value": value, "status": status}
+
+    if be_no_key:
+        try:
+            db.upsert_boe_record(be_no_key, variable_fields)
+        except Exception as e:
+            st.error(f"⚠️ Could not save variable items to Supabase: {e}")
+
     import pandas as pd
 
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -2377,7 +2482,8 @@ if pdf_file:
 
     with st.spinner("✍️ Filling Excel..."):
         try:
-            filled_bytes = fill_excel(header, meta, items, all_duties, all_bcd_forgone, licences, assess_values)
+            filled_bytes = fill_excel(header, meta, items, all_duties, all_bcd_forgone, licences,
+                                       assess_values, variable_fields)
             filename = f"BOE_{meta.get('inv_no', 'filled')}.xlsx"
             if filled_bytes is None:
                 st.error("❌ fill_excel returned None — check _fill_c_sheet for errors")
