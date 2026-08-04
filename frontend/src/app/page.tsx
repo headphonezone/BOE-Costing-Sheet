@@ -26,6 +26,12 @@ export default async function HomePage() {
             {boes.length} Bill{boes.length === 1 ? "" : "s"} of Entry on file
           </p>
         </div>
+        <Link
+          href="/upload"
+          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700"
+        >
+          + Upload BOE
+        </Link>
       </div>
 
       {error && (

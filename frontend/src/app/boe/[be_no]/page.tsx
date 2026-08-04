@@ -13,13 +13,14 @@ import {
 import { SummaryTile } from "@/components/SummaryTile";
 import { EditableField } from "@/components/EditableField";
 import { StatusBadge } from "@/components/StatusBadge";
+import { DocumentsPanel } from "@/components/DocumentsPanel";
 
 function fmtMoney(n: number | null | undefined) {
   if (n === null || n === undefined) return "—";
   return n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
 
-type Section = "overview" | "duty" | "licences" | "history";
+type Section = "overview" | "duty" | "licences" | "history" | "documents";
 
 export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
   const { be_no } = use(props.params);
@@ -31,6 +32,7 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
     duty: useRef<HTMLDivElement>(null),
     licences: useRef<HTMLDivElement>(null),
     history: useRef<HTMLDivElement>(null),
+    documents: useRef<HTMLDivElement>(null),
   };
 
   async function reload() {
@@ -68,7 +70,7 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
     );
   }
 
-  const { boe, items, licences, variableFields, fieldHistory } = detail;
+  const { boe, items, licences, variableFields, fieldHistory, documents } = detail;
 
   const vfDefaults: Record<VariableFieldKey, { value: number; status: FieldStatus }> = {
     exchange_rate: { value: variableFields?.exchange_rate ?? boe.exchange_rate ?? 0, status: variableFields?.exchange_rate_status ?? "provisional" },
@@ -155,6 +157,12 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
           value={`${fieldHistory.length} change${fieldHistory.length === 1 ? "" : "s"}`}
           active={activeSection === "history"}
           onClick={() => goTo("history")}
+        />
+        <SummaryTile
+          label="Documents"
+          value={`${documents.length} file${documents.length === 1 ? "" : "s"}`}
+          active={activeSection === "documents"}
+          onClick={() => goTo("documents")}
         />
       </div>
 
@@ -284,6 +292,12 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
             </table>
           </div>
         )}
+      </section>
+
+      {/* Supporting documents */}
+      <section ref={sectionRefs.documents} className="mb-10 scroll-mt-6">
+        <h2 className="mb-3 text-lg font-semibold">Supporting Documents ({documents.length})</h2>
+        <DocumentsPanel be_no={be_no} documents={documents} onUploaded={reload} />
       </section>
     </main>
   );
