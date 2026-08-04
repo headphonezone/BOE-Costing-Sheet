@@ -1496,8 +1496,16 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
             meta['misc_charges_inr'] = round(float(nums[0]) * exchange_rate, 2)
 
     items = []
+    # FIX: unit price / quantity / amount previously required at least one
+    # digit before the decimal point ([\d]+\.[\d]...). Values under 1 are
+    # sometimes printed without a leading zero (e.g. ".200000"), which
+    # failed to match at all and silently dropped the whole item line --
+    # taking its BCD/SWS/IGST/Paid-Cyber-Receipt with it, since those are
+    # keyed by an item number that was never registered. [\d]* (zero or
+    # more) makes the leading digit optional without hardcoding any
+    # specific value.
     item_pat = re.compile(
-        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]+\.[\d]{4,6})\s+([\d]+\.[\d]{4,6})\s+(?:PCS|SET|NOS)\s+([\d]+\.[\d]+)',
+        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]*\.[\d]{4,6})\s+([\d]*\.[\d]{4,6})\s+(?:PCS|SET|NOS)\s+([\d]*\.[\d]+)',
         re.MULTILINE
     )
     for m in item_pat.finditer(page2_text):
