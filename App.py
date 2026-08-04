@@ -1234,11 +1234,25 @@ def get_template_bytes() -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_row_words(page, min_x: float = 60) -> dict:
+    """
+    FIX: rows were previously bucketed by round(w['top']) (nearest whole
+    point). In dense tables (e.g. a 30-42 row F. LICENCE DETAILS block,
+    much taller than typical), consecutive rows can be pitched closer than
+    1pt apart, so two genuinely different rows round to the same integer
+    and silently merge into one bucket. Downstream code (e.g.
+    parse_licences_from_page) assigns each anchor field with a plain `=`,
+    so a merged bucket just keeps whichever row's value it saw last and
+    the other row vanishes entirely -- with no error, just a missing
+    licence line. Rounding to 1 decimal place instead keeps genuinely
+    same-line words together (their tops are identical or differ by
+    floating-point noise, e.g. <0.05) while no longer coalescing distinct
+    rows that happen to straddle a whole-integer boundary.
+    """
     words = page.extract_words()
     rows = defaultdict(list)
     for w in words:
         if w['x0'] > min_x:
-            rows[round(w['top'])].append((w['x0'], w['text']))
+            rows[round(w['top'], 1)].append((w['x0'], w['text']))
     return {y: sorted(v, key=lambda x: x[0]) for y, v in rows.items()}
 
 
