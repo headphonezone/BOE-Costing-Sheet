@@ -1752,6 +1752,31 @@ def parse_licences_from_page(page) -> list[dict]:
             elif 505 <= x <= 575 and re.match(r'^[\d.]+$', t):
                 debit_duty = float(t)
 
+        # FIX (item numbers dropped in dense licence tables, e.g. "42
+        # licences in PDF, only 41 captured"): the ITMSNO token itself can
+        # be corrupted with a bleeding stray letter (e.g. "A24", same
+        # bleed-through pattern as the MISC CHARGE "E 1690" case) *and*
+        # vertically displaced by a couple points from the rest of its own
+        # row, landing in a different row bucket than its invsno/lic_no/
+        # debit_duty. When that happens the anchor never completes on this
+        # row's own bucket and the whole row was silently dropped. If
+        # invsno/debit_duty anchor a real row but itmsno is missing here,
+        # check nearby buckets (within 4pt -- closer than this table's
+        # normal row pitch, so it can't accidentally grab a neighboring
+        # row's own itmsno) for a stray digits-bearing token in that column.
+        if itmsno is None and invsno is not None and debit_duty is not None:
+            for y2 in sorted_ys:
+                if y2 == y or abs(y2 - y) > 4:
+                    continue
+                for x2, t2 in row_words[y2]:
+                    if 105 <= x2 <= 135:
+                        digits = re.sub(r'\D', '', t2)
+                        if digits:
+                            itmsno = int(digits)
+                            break
+                if itmsno is not None:
+                    break
+
         if invsno is None or itmsno is None or debit_duty is None:
             continue
 
