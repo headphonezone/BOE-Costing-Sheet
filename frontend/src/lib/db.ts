@@ -1,4 +1,4 @@
-import { supabase } from "./supabase";
+import { supabase, API_BASE_URL } from "./supabase";
 import type {
   Boe,
   BoeItem,
@@ -81,4 +81,17 @@ export async function updateVariableField(
     new_status: status,
   });
   if (historyError) throw historyError;
+}
+
+/**
+ * Permanently deletes a BOE (rows across every table + its Storage files).
+ * Goes through the backend rather than Supabase directly so the Storage
+ * cleanup runs under the backend's service-role key.
+ */
+export async function deleteBoe(be_no: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/boe/${be_no}`, { method: "DELETE" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Failed to delete ${be_no} (${res.status})`);
+  }
 }

@@ -135,6 +135,34 @@ def upload_document(be_no: str, file_name: str, file_bytes: bytes, doc_type: str
     return storage_path
 
 
+def delete_boe(be_no: str) -> bool:
+    """
+    Permanently deletes a BOE and everything tied to it: item rows, licence
+    rows, variable fields, field-history entries, the boe_documents index,
+    and the underlying files in Storage. Returns False if no such BOE
+    exists (caller should 404 rather than pretend anything happened).
+    """
+    existing = _client.table('boes').select('be_no').eq('be_no', be_no).limit(1).execute().data
+    if not existing:
+        return False
+
+    # boe_documents already stores the exact storage_path used at upload
+    # time, so just delete those known paths instead of re-deriving or
+    # walking Storage folders.
+    docs = _client.table('boe_documents').select('storage_path').eq('be_no', be_no).execute().data
+    paths = [d['storage_path'] for d in docs if d.get('storage_path')]
+    if paths:
+        _client.storage.from_(DOCS_BUCKET).remove(paths)
+
+    _client.table('boe_field_history').delete().eq('be_no', be_no).execute()
+    _client.table('boe_variable_fields').delete().eq('be_no', be_no).execute()
+    _client.table('boe_documents').delete().eq('be_no', be_no).execute()
+    _client.table('boe_licences').delete().eq('be_no', be_no).execute()
+    _client.table('boe_items').delete().eq('be_no', be_no).execute()
+    _client.table('boes').delete().eq('be_no', be_no).execute()
+    return True
+
+
 def list_boes() -> list:
     resp = _client.table('boes').select('*').order('updated_at', desc=True).execute()
     return resp.data

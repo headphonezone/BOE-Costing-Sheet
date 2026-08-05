@@ -2,7 +2,8 @@
 
 import { use, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { getBoeDetail, updateVariableField, type BoeDetail } from "@/lib/db";
+import { useRouter } from "next/navigation";
+import { getBoeDetail, updateVariableField, deleteBoe, type BoeDetail } from "@/lib/db";
 import { API_BASE_URL } from "@/lib/supabase";
 import {
   VARIABLE_FIELDS,
@@ -24,8 +25,10 @@ type Section = "overview" | "duty" | "licences" | "history" | "documents";
 
 export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
   const { be_no } = use(props.params);
+  const router = useRouter();
 
   const [detail, setDetail] = useState<BoeDetail | null | undefined>(undefined);
+  const [deleting, setDeleting] = useState(false);
   const [activeSection, setActiveSection] = useState<Section>("overview");
   const sectionRefs = {
     overview: useRef<HTMLDivElement>(null),
@@ -53,6 +56,21 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
   async function handleFieldChange(field: VariableFieldKey, value: number, status: FieldStatus) {
     await updateVariableField(be_no, field, value, status, detail?.variableFields ?? null);
     await reload();
+  }
+
+  async function handleDelete() {
+    const ok = window.confirm(
+      `Permanently delete BE No ${be_no}? This removes all its items, licences, field history, and uploaded documents. This cannot be undone.`
+    );
+    if (!ok) return;
+    setDeleting(true);
+    try {
+      await deleteBoe(be_no);
+      router.push("/");
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "Failed to delete BOE");
+      setDeleting(false);
+    }
   }
 
   if (detail === undefined) {
@@ -97,12 +115,22 @@ export default function BoeDashboardPage(props: PageProps<"/boe/[be_no]">) {
             {boe.supplier_name ?? "Unknown supplier"} · Invoice {boe.inv_no ?? "—"} · {boe.be_date ?? "—"}
           </p>
         </div>
-        <a
-          href={`${API_BASE_URL}/boe/${be_no}/excel`}
-          className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700"
-        >
-          Download Excel
-        </a>
+        <div className="flex gap-2">
+          <a
+            href={`${API_BASE_URL}/boe/${be_no}/excel`}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700"
+          >
+            Download Excel
+          </a>
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={deleting}
+            className="rounded-lg border border-red-300 px-4 py-2 text-sm font-medium text-red-600 transition hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950"
+          >
+            {deleting ? "Deleting…" : "Delete BOE"}
+          </button>
+        </div>
       </div>
 
       {/* Summary tiles */}

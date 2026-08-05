@@ -136,6 +136,14 @@ def get_boe(be_no: str):
     return result
 
 
+@app.delete("/boe/{be_no}")
+def delete_boe(be_no: str):
+    deleted = db.delete_boe(be_no)
+    if not deleted:
+        raise HTTPException(404, f"No BOE found for {be_no}")
+    return {'ok': True}
+
+
 class FieldUpdate(BaseModel):
     field_name: str
     value: float
