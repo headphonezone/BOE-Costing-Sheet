@@ -1507,8 +1507,14 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
     # keyed by an item number that was never registered. [\d]* (zero or
     # more) makes the leading digit optional without hardcoding any
     # specific value.
+    #
+    # FIX (Bug 2): item_pat's UQC alternation was missing "UNT" (Units) --
+    # same failure mode as Bug 1, just a different code. A BOE with items
+    # quoted in UNT (e.g. Soloist/Conductor Voyager amp units) had those
+    # rows silently dropped while PCS-quoted items on the same page parsed
+    # fine, making it look like only "some" items came through.
     item_pat = re.compile(
-        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]*\.[\d]{4,6})\s+([\d]*\.[\d]{4,6})\s+(?:PCS|SET|NOS)\s+([\d]*\.[\d]+)',
+        r'^[A-Z\s]{0,3}(\d{1,2})\s+[\dOI]{7,9}\s+(.+?)\s+([\d]*\.[\d]{4,6})\s+([\d]*\.[\d]{4,6})\s+(?:PCS|SET|NOS|UNT)\s+([\d]*\.[\d]+)',
         re.MULTILINE
     )
     for m in item_pat.finditer(page2_text):
@@ -1518,10 +1524,41 @@ def parse_page2(page2_text: str, exchange_rate: float) -> tuple[dict, list[dict]
         for _b, _g in [('ACCESSORIESC', 'ACCESSORIES'), ('ACCOESSORIES', 'ACCESSORIES'),
                        ('HEADPHYONE', 'HEADPHONE'), ('BLYACK', 'BLACK')]:
             desc = desc.replace(_b, _g)
+        # FIX (Bug 3): only the single line immediately after the match was
+        # ever appended to desc, so descriptions wrapping 2+ continuation
+        # lines (e.g. a 4-line cell where only line 1 carries the price/
+        # qty/UQC/amount) got silently truncated after the first wrapped
+        # line. Loop over consecutive lines instead, stopping at the next
+        # item's own "sno + CTH code" line, a blank line, or GLOSSARY.
         end = m.end()
-        nxt = page2_text[end:end + 150].strip().split('\n')[0].strip()
-        if nxt and not re.match(r'^\d+\s+8', nxt) and 'GLOSSARY' not in nxt:
-            combined = re.sub(r'\s+', ' ', desc + ' ' + nxt).strip()
+        tail_lines = []
+        started = False
+        # capped at 4 wrapped lines: real BOE description cells don't run
+        # longer than that, and it keeps a missing stop-boundary (e.g. the
+        # last item on the page, right before an unrelated summary line)
+        # from swallowing content that was never part of the description.
+        for line in page2_text[end:end + 400].split('\n')[:5]:
+            line = line.strip()
+            if not line:
+                # the match itself ends mid-line, right before its own
+                # trailing newline, so the first split element is always
+                # this empty leftover -- skip it, but a blank line once
+                # we're already inside the continuation means the cell
+                # (and thus the description) has ended.
+                if started:
+                    break
+                continue
+            if ('GLOSSARY' in line
+                    or re.match(r'^\d{1,2}\s+[\dOI]{7,9}\s', line)
+                    # invoice valuation summary line (inv_value/freight/
+                    # insurance ... DP) that follows the item table -- never
+                    # part of a description.
+                    or re.match(r'^[\d.]+\s+[\d.]+\s+[\d.]+\s+DP\b', line)):
+                break
+            tail_lines.append(line)
+            started = True
+        if tail_lines:
+            combined = re.sub(r'\s+', ' ', desc + ' ' + ' '.join(tail_lines)).strip()
             combined = re.sub(r'\b[A-Z]\b\s*', '', combined).strip()
             for _b, _g in [('ACCESSORIESC', 'ACCESSORIES'), ('ACCOESSORIES', 'ACCESSORIES'),
                            ('HEADPHYONE', 'HEADPHONE'), ('BLYACK', 'BLACK')]:
