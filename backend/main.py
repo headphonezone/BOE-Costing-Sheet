@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import boe_parser as bp  # noqa: E402
 
 from . import supabase_client as db  # noqa: E402
+from . import doc_extract  # noqa: E402
 
 app = FastAPI(title="BOE Costing API")
 
@@ -119,8 +120,21 @@ async def upload_supporting_document(be_no: str, doc_type: str = "OTHER", file: 
     if not existing:
         raise HTTPException(404, f"No BOE found for {be_no}")
     file_bytes = await file.read()
-    path = db.upload_document(be_no, file.filename or "document", file_bytes, doc_type=doc_type)
-    return {'storage_path': path}
+    file_name = file.filename or "document"
+    path = db.upload_document(be_no, file_name, file_bytes, doc_type=doc_type)
+
+    extraction = None
+    try:
+        fields = doc_extract.extract_document(doc_type, file_name, file_bytes)
+        if fields is not None:
+            db.save_document_extraction(be_no, path, doc_type, fields)
+            extraction = fields
+    except Exception:
+        # A malformed/unreadable supporting doc shouldn't block the upload
+        # itself -- the file is already safely stored either way.
+        pass
+
+    return {'storage_path': path, 'extraction': extraction}
 
 
 @app.get("/boe")

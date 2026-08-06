@@ -1,8 +1,26 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { API_BASE_URL, supabase } from "@/lib/supabase";
 import type { BoeDocument } from "@/lib/types";
+
+function fmtNum(n: number | null | undefined) {
+  if (n === null || n === undefined) return "—";
+  return n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+
+function extractionSummary(doc: BoeDocument): string {
+  const e = doc.extraction;
+  if (!e) return doc.doc_type === "BOE" ? "" : "No data extracted";
+  const parts: string[] = [];
+  if (e.doc_number) parts.push(e.doc_number);
+  if (e.total_value !== null) parts.push(`${e.currency ?? ""} ${fmtNum(e.total_value)}`.trim());
+  if (e.total_packages !== null) parts.push(`${e.total_packages} pkgs`);
+  if (e.gross_weight_kg !== null) parts.push(`${fmtNum(e.gross_weight_kg)} kg gross`);
+  if (e.certificate_no) parts.push(e.certificate_no);
+  if (e.origin_country) parts.push(e.origin_country);
+  return parts.length > 0 ? parts.join(" · ") : "No structured fields found";
+}
 
 const DOC_TYPES = ["BOE", "INVOICE", "PACKING_LIST", "COO", "OTHER"] as const;
 const DOCS_BUCKET = "boe-documents";
@@ -19,6 +37,7 @@ export function DocumentsPanel({
   const [docType, setDocType] = useState<(typeof DOC_TYPES)[number]>("INVOICE");
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // The boe-documents bucket is private, so links need signed URLs (not
@@ -113,36 +132,97 @@ export function DocumentsPanel({
               <tr>
                 <th className="px-3 py-2">Type</th>
                 <th className="px-3 py-2">File</th>
+                <th className="px-3 py-2">Extracted Data</th>
                 <th className="px-3 py-2">Uploaded</th>
               </tr>
             </thead>
             <tbody>
-              {documents.map((doc) => (
-                <tr key={doc.id} className="border-t border-slate-100 dark:border-slate-800">
-                  <td className="px-3 py-2">
-                    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                      {doc.doc_type}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2">
-                    <a
-                      href={fileUrl(doc.storage_path) || undefined}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={
-                        fileUrl(doc.storage_path)
-                          ? "text-blue-600 hover:underline"
-                          : "cursor-default text-slate-400"
-                      }
+              {documents.map((doc) => {
+                const hasDetail = Boolean(
+                  doc.extraction && (doc.extraction.line_items?.length || doc.extraction.raw_text)
+                );
+                const isOpen = expanded === doc.id;
+                return (
+                  <Fragment key={doc.id}>
+                    <tr
+                      className={`border-t border-slate-100 dark:border-slate-800 ${
+                        hasDetail ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800/50" : ""
+                      }`}
+                      onClick={() => hasDetail && setExpanded(isOpen ? null : doc.id)}
                     >
-                      {doc.file_name}
-                    </a>
-                  </td>
-                  <td className="px-3 py-2 text-xs text-slate-400">
-                    {new Date(doc.uploaded_at).toLocaleString()}
-                  </td>
-                </tr>
-              ))}
+                      <td className="px-3 py-2">
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                          {doc.doc_type}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <a
+                          href={fileUrl(doc.storage_path) || undefined}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
+                          className={
+                            fileUrl(doc.storage_path)
+                              ? "text-blue-600 hover:underline"
+                              : "cursor-default text-slate-400"
+                          }
+                        >
+                          {doc.file_name}
+                        </a>
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-500">
+                        {extractionSummary(doc)}
+                        {hasDetail && (
+                          <span className="ml-1 text-slate-400">{isOpen ? "▲" : "▼"}</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-400">
+                        {new Date(doc.uploaded_at).toLocaleString()}
+                      </td>
+                    </tr>
+                    {isOpen && doc.extraction && (
+                      <tr className="border-t border-slate-100 bg-slate-50 dark:border-slate-800 dark:bg-slate-800/30">
+                        <td colSpan={4} className="px-3 py-3">
+                          {doc.extraction.line_items && doc.extraction.line_items.length > 0 && (
+                            <div className="mb-3 overflow-x-auto">
+                              <table className="w-full text-xs">
+                                <thead className="text-left text-slate-400">
+                                  <tr>
+                                    <th className="pr-3 py-1">Description</th>
+                                    <th className="pr-3 py-1 text-right">Qty</th>
+                                    <th className="pr-3 py-1 text-right">Unit Price</th>
+                                    <th className="pr-3 py-1 text-right">Amount</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {doc.extraction.line_items.map((li, i) => (
+                                    <tr key={i} className="border-t border-slate-200 dark:border-slate-700">
+                                      <td className="pr-3 py-1">{li.description}</td>
+                                      <td className="pr-3 py-1 text-right tabular-nums">{fmtNum(li.qty)}</td>
+                                      <td className="pr-3 py-1 text-right tabular-nums">{fmtNum(li.unit_price)}</td>
+                                      <td className="pr-3 py-1 text-right tabular-nums">{fmtNum(li.amount)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                          {doc.extraction.raw_text && (
+                            <details>
+                              <summary className="cursor-pointer text-xs text-slate-500">
+                                Raw extracted text
+                              </summary>
+                              <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap text-xs text-slate-500">
+                                {doc.extraction.raw_text}
+                              </pre>
+                            </details>
+                          )}
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -4,6 +4,7 @@ import type {
   BoeItem,
   BoeLicence,
   BoeDocument,
+  BoeDocumentExtraction,
   BoeVariableFields,
   BoeFieldHistory,
   VariableFieldKey,
@@ -20,27 +21,43 @@ export type BoeDetail = {
 };
 
 export async function getBoeDetail(be_no: string): Promise<BoeDetail | null> {
-  const [{ data: boe }, { data: items }, { data: licences }, { data: documents }, { data: vf }, { data: history }] =
-    await Promise.all([
-      supabase.from("boes").select("*").eq("be_no", be_no).maybeSingle(),
-      supabase.from("boe_items").select("*").eq("be_no", be_no).order("global_sno"),
-      supabase.from("boe_licences").select("*").eq("be_no", be_no),
-      supabase.from("boe_documents").select("*").eq("be_no", be_no),
-      supabase.from("boe_variable_fields").select("*").eq("be_no", be_no).maybeSingle(),
-      supabase
-        .from("boe_field_history")
-        .select("*")
-        .eq("be_no", be_no)
-        .order("changed_at", { ascending: false }),
-    ]);
+  const [
+    { data: boe },
+    { data: items },
+    { data: licences },
+    { data: documents },
+    { data: extractions },
+    { data: vf },
+    { data: history },
+  ] = await Promise.all([
+    supabase.from("boes").select("*").eq("be_no", be_no).maybeSingle(),
+    supabase.from("boe_items").select("*").eq("be_no", be_no).order("global_sno"),
+    supabase.from("boe_licences").select("*").eq("be_no", be_no),
+    supabase.from("boe_documents").select("*").eq("be_no", be_no),
+    supabase.from("boe_document_extractions").select("*").eq("be_no", be_no),
+    supabase.from("boe_variable_fields").select("*").eq("be_no", be_no).maybeSingle(),
+    supabase
+      .from("boe_field_history")
+      .select("*")
+      .eq("be_no", be_no)
+      .order("changed_at", { ascending: false }),
+  ]);
 
   if (!boe) return null;
+
+  const extractionsByPath = new Map(
+    ((extractions ?? []) as BoeDocumentExtraction[]).map((e) => [e.storage_path, e])
+  );
+  const documentsWithExtraction = ((documents ?? []) as BoeDocument[]).map((d) => ({
+    ...d,
+    extraction: extractionsByPath.get(d.storage_path) ?? null,
+  }));
 
   return {
     boe: boe as Boe,
     items: (items ?? []) as BoeItem[],
     licences: (licences ?? []) as BoeLicence[],
-    documents: (documents ?? []) as BoeDocument[],
+    documents: documentsWithExtraction,
     variableFields: (vf ?? null) as BoeVariableFields | null,
     fieldHistory: (history ?? []) as BoeFieldHistory[],
   };

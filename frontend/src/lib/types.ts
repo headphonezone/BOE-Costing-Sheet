@@ -57,6 +57,33 @@ export type BoeDocument = {
   file_name: string | null;
   storage_path: string;
   uploaded_at: string;
+  extraction?: BoeDocumentExtraction | null;
+};
+
+export type BoeDocumentLineItem = {
+  description: string;
+  qty: number;
+  unit_price: number;
+  amount: number;
+};
+
+export type BoeDocumentExtraction = {
+  id: number;
+  be_no: string;
+  storage_path: string;
+  doc_type: string;
+  doc_number: string | null;
+  doc_date: string | null;
+  total_value: number | null;
+  currency: string | null;
+  total_packages: number | null;
+  gross_weight_kg: number | null;
+  net_weight_kg: number | null;
+  certificate_no: string | null;
+  origin_country: string | null;
+  line_items: BoeDocumentLineItem[] | null;
+  raw_text: string | null;
+  extracted_at: string;
 };
 
 export const VARIABLE_FIELDS = [

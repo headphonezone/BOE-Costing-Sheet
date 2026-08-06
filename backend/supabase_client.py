@@ -135,6 +135,22 @@ def upload_document(be_no: str, file_name: str, file_bytes: bytes, doc_type: str
     return storage_path
 
 
+def save_document_extraction(be_no: str, storage_path: str, doc_type: str, fields: dict) -> None:
+    """
+    Upserts the structured fields pulled from one supporting document (see
+    doc_extract.py). Keyed by storage_path -- same re-upload dedup pattern
+    as boe_documents, so replacing a document replaces its extraction too
+    instead of piling up stale rows.
+    """
+    row = {
+        'be_no': be_no,
+        'storage_path': storage_path,
+        'doc_type': doc_type,
+        **fields,
+    }
+    _client.table('boe_document_extractions').upsert(row, on_conflict='storage_path').execute()
+
+
 def delete_boe(be_no: str) -> bool:
     """
     Permanently deletes a BOE and everything tied to it: item rows, licence
@@ -156,6 +172,7 @@ def delete_boe(be_no: str) -> bool:
 
     _client.table('boe_field_history').delete().eq('be_no', be_no).execute()
     _client.table('boe_variable_fields').delete().eq('be_no', be_no).execute()
+    _client.table('boe_document_extractions').delete().eq('be_no', be_no).execute()
     _client.table('boe_documents').delete().eq('be_no', be_no).execute()
     _client.table('boe_licences').delete().eq('be_no', be_no).execute()
     _client.table('boe_items').delete().eq('be_no', be_no).execute()
@@ -175,9 +192,13 @@ def get_boe(be_no: str) -> dict | None:
     items = _client.table('boe_items').select('*').eq('be_no', be_no).order('global_sno').execute().data
     licences = _client.table('boe_licences').select('*').eq('be_no', be_no).execute().data
     documents = _client.table('boe_documents').select('*').eq('be_no', be_no).execute().data
+    extractions = _client.table('boe_document_extractions').select('*').eq('be_no', be_no).execute().data
     variable_fields = _client.table('boe_variable_fields').select('*').eq('be_no', be_no).limit(1).execute().data
     history = _client.table('boe_field_history').select('*').eq('be_no', be_no)\
         .order('changed_at', desc=True).execute().data
+    extractions_by_path = {e['storage_path']: e for e in extractions}
+    for doc in documents:
+        doc['extraction'] = extractions_by_path.get(doc['storage_path'])
     return {
         'boe': boe[0],
         'items': items,
